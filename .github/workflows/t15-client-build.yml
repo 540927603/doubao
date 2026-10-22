@@ -52,14 +52,26 @@ jobs:
           UPLOAD_TOKEN: ${{ inputs.upload_token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $ok = $false
-          for ($i = 1; $i -le 5; $i++) {
+          for ($i = 1; $i -le 6; $i++) {
             Write-Host "download try $i ..."
             curl.exe -sS --max-time 600 -o client-src.zip "$env:SITE_URL/api/gh_build/source?token=$env:UPLOAD_TOKEN"
-            if ((Test-Path client-src.zip) -and ((Get-Item client-src.zip).Length -gt 100000)) { $ok = $true; break }
+            $sz = (Test-Path client-src.zip) ? (Get-Item client-src.zip).Length : 0
+            Write-Host "curl exit=$LASTEXITCODE zip size=$sz"
+            # 跨太平洋链路偶发截断(curl 18), 差几 KB 也过不了 size 关 → 必须验 zip 中央目录
+            if ($sz -gt 100000 -and $LASTEXITCODE -eq 0) {
+              try {
+                $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path client-src.zip))
+                $n = $z.Entries.Count; $z.Dispose()
+                if ($n -gt 10) { Write-Host "zip OK, entries=$n"; $ok = $true; break }
+                Write-Host "zip entries=$n 异常偏少"
+              } catch { Write-Host "zip 损坏: $($_.Exception.Message)" }
+            }
+            Remove-Item client-src.zip -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 10
           }
-          if (-not $ok) { throw '下载客户端源码 zip 失败' }
+          if (-not $ok) { throw '下载客户端源码 zip 失败(重试后仍不完整)' }
           Expand-Archive client-src.zip -DestinationPath client-src -Force
           Get-ChildItem client-src | Select-Object Name, Length | Format-Table | Out-String | Write-Host
 
