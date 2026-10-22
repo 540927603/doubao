@@ -1,0 +1,146 @@
+# test15 客户端远程构建 workflow(由总后台「推送 Workflow」自动写入 GH 仓库, 不要手改这份以外的副本)
+#
+# 触发: 服务器 workflow_dispatch 下发 inputs(version / upload_token / site_url)
+# 流程: 下载服务器上的源码 zip → pip 依赖 → build_exe.py --installer(PyInstaller onedir + ISCC)
+#       → 分片回传安装包到服务器 /api/gh_build/{chunk,complete} → 落库为主模板
+# 说明: 中国服务器单连接收 200MB 级文件实测必超时(test10 教训), 因此按 8MB 分片 + 每片重试;
+#       产物同时传 GitHub artifact 兜底(保留 7 天), 服务器回传失败可人工取回。
+
+name: t15-client-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '客户端版本号(示例 1.0.0)'
+        required: true
+        default: '1.0.0'
+      upload_token:
+        description: 'test15 回传令牌(服务器自动下发)'
+        required: true
+      site_url:
+        description: 'test15 站点地址(示例 https://test15.5ghcy.com)'
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Ping server (fail fast on bad token)
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+        run: |
+          $r = curl.exe -sS --max-time 60 -H "X-T15-Token: $env:UPLOAD_TOKEN" "$env:SITE_URL/api/gh_build/ping"
+          Write-Host "ping => $r"
+          if ($r -notmatch '"code":0') { throw "服务器连通/令牌校验失败: $r" }
+
+      - name: Download client source from server
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "download try $i ..."
+            curl.exe -sS --max-time 600 -o client-src.zip "$env:SITE_URL/api/gh_build/source?token=$env:UPLOAD_TOKEN"
+            if ((Test-Path client-src.zip) -and ((Get-Item client-src.zip).Length -gt 100000)) { $ok = $true; break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { throw '下载客户端源码 zip 失败' }
+          Expand-Archive client-src.zip -DestinationPath client-src -Force
+          Get-ChildItem client-src | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+      - name: Install dependencies
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r client-src/requirements.txt
+          python -c "import PyInstaller, webview, playwright; print('deps ok')"
+
+      - name: Build master installer
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          Set-Location client-src
+          python build_exe.py --installer --version "${{ inputs.version }}"
+
+      - name: Upload installer to server (chunked, resumable)
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem "client-src/installer_out/T15Setup-*.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw '未找到安装器产物 client-src/installer_out/T15Setup-*.exe' }
+          Write-Host ("artifact: {0} size={1}" -f $exe.Name, $exe.Length)
+          $api = "$env:SITE_URL/api/gh_build"
+          $uploadId = -join ((1..24) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+          $fullSha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $chunkSize = 8MB
+          $total = [int][math]::Ceiling($bytes.Length / $chunkSize)
+          function Invoke-Retry([scriptblock]$s) {
+            for ($a = 1; $a -le 6; $a++) {
+              try { return & $s } catch { Write-Host "attempt $a failed: $_"; Start-Sleep -Seconds (15 * $a) }
+            }
+            throw '分片重试次数耗尽'
+          }
+          for ($i = 0; $i -lt $total; $i++) {
+            $take = [int][math]::Min($chunkSize, $bytes.Length - $i * $chunkSize)
+            $chunk = New-Object byte[] $take
+            [Array]::Copy($bytes, $i * $chunkSize, $chunk, 0, $take)
+            $tmp = Join-Path $env:TEMP "c$i.bin"
+            [System.IO.File]::WriteAllBytes($tmp, $chunk)
+            $sha = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("chunk {0}/{1} size={2} sha={3}" -f ($i + 1), $total, $take, $sha.Substring(0, 12))
+            $tmpUrl = ($tmp -replace '\\', '/')
+            Invoke-Retry {
+              $r = curl.exe -sS --max-time 900 -H "X-T15-Token: $env:UPLOAD_TOKEN" `
+                -F "upload_id=$uploadId" -F "index=$($i + 1)" -F "total=$total" `
+                -F "sha256=$sha" -F "file=@$tmpUrl" "$api/chunk"
+              Write-Host $r
+              if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+              if ($r -notmatch '"code":0') { throw "分片被拒绝: $r" }
+            }
+            Remove-Item $tmp -Force
+          }
+          Write-Host 'all chunks uploaded, completing...'
+          Invoke-Retry {
+            $r = curl.exe -sS --max-time 300 -H "X-T15-Token: $env:UPLOAD_TOKEN" `
+              -F "upload_id=$uploadId" -F "version=$env:VERSION" -F "total_chunks=$total" `
+              -F "size=$($bytes.Length)" -F "sha256=$fullSha" `
+              -F "run_url=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" `
+              "$api/complete"
+            Write-Host $r
+            if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+            if ($r -notmatch '"code":0') { throw "合并入库失败: $r" }
+          }
+          Write-Host 'master template uploaded to server OK'
+
+      - name: Upload artifact backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: T15Setup-${{ inputs.version }}
+          path: client-src/installer_out/*.exe
+          retention-days: 7
+          if-no-files-found: ignore
