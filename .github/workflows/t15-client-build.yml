@@ -100,9 +100,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Get-ChildItem "client-src/installer_out/T15Setup-*.exe" |
+          $exe = Get-ChildItem "client-src/installer_out/doubao-*.exe" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $exe) { throw '未找到安装器产物 client-src/installer_out/T15Setup-*.exe' }
+          if (-not $exe) { throw '未找到安装器产物 client-src/installer_out/doubao-*.exe' }
           Write-Host ("artifact: {0} size={1}" -f $exe.Name, $exe.Length)
           $api = "$env:SITE_URL/api/gh_build"
           $uploadId = -join ((1..24) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
@@ -152,7 +152,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: T15Setup-${{ inputs.version }}
+          name: doubao-${{ inputs.version }}
           path: client-src/installer_out/*.exe
           retention-days: 7
           if-no-files-found: ignore
