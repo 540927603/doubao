@@ -12,7 +12,8 @@
 #   4) 客户端 exe VersionInfo 品牌化(ProductName/FileDescription/FileVersion)
 #   5) Chromium 落地约定路径 ms-playwright\chromium-1134\chrome-win(64)\chrome.exe
 #   6) 卸载注册表 DisplayName = 品牌名
-# 证据: Inno /LOG 完整安装日志 + 校验报告 + {app} 目录清单 全部传 GH artifact
+#   7) 静默卸载: 退出码 0 + 日志无 unknown constant + 品牌 exe/brand.* 补删干净
+# 证据: Inno /LOG 完整安装日志 + 卸载日志 + 校验报告 + {app} 目录清单 全部传 GH artifact
 
 name: t15-install-verify
 
@@ -203,6 +204,52 @@ jobs:
           if ($script:failed) { throw '存在 FAIL 项, 根因详见上方报告与安装日志' }
           Write-Host '全部验证项 PASS'
 
+      # 7) 卸载链路真实验证(2026-10-24 用户实测 unins000 弹 "unknown constant
+      #    uninstalldisplayname" 的根因复现): 静默卸载必须退出码 0、无 unknown constant
+      #    报错、品牌名 exe / brand.json / brand.ico / brand.ini 补删干净。
+      - name: Run uninstaller (VERYSILENT, verify no unknown-constant error)
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $unlog = Join-Path $env:RUNNER_TEMP 't15_uninstall.log'
+          $unexe = Join-Path $app 'unins000.exe'
+          if (-not (Test-Path -LiteralPath $unexe)) { throw "卸载器不存在: $unexe" }
+          $p = Start-Process -FilePath $unexe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$unlog" `
+            -Wait -PassThru
+          Write-Host "uninstaller exit code = $($p.ExitCode)"
+          if (Test-Path -LiteralPath $unlog) {
+            Write-Host '--- 卸载日志最后 120 行 ---'
+            Get-Content -LiteralPath $unlog -Tail 120 | Write-Host
+          } else {
+            Write-Host '!! 未生成卸载日志'
+          }
+          $script:failed = $false
+          if ($p.ExitCode -ne 0) { $script:failed = $true; Write-Host "!! 卸载退出码非 0: $($p.ExitCode)" }
+          $logText = if (Test-Path -LiteralPath $unlog) { Get-Content -LiteralPath $unlog -Raw } else { '' }
+          if ($logText -match 'unknown constant') {
+            $script:failed = $true
+            Write-Host "!! 卸载日志出现 unknown constant 报错(1.0.14 及之前用户实测问题未修复)"
+          } else {
+            Write-Host '卸载日志无 unknown constant 报错'
+          }
+          # 品牌补删清单落地检查
+          foreach ($n in @("$env:EXPECT_APP_NAME.exe", 'doubaoClient.exe', 'brand.json', 'brand.ico', 'brand.ini')) {
+            $t = Join-Path $app $n
+            if (Test-Path -LiteralPath $t) {
+              $script:failed = $true
+              Write-Host "!! 卸载后仍残留: $t"
+            } else {
+              Write-Host "卸载补删干净: $n"
+            }
+          }
+          Copy-Item -LiteralPath $unlog -Destination (Join-Path $env:RUNNER_TEMP 't15_uninstall.log') -ErrorAction SilentlyContinue
+          if ($script:failed) { throw '卸载验证存在 FAIL 项' }
+          Write-Host '卸载验证 PASS: 无 unknown constant, 品牌产物补删干净'
+
       - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -210,6 +257,7 @@ jobs:
           name: install-verify-evidence
           path: |
             ${{ runner.temp }}/t15_install.log
+            ${{ runner.temp }}/t15_uninstall.log
             ${{ runner.temp }}/verify_report.txt
             ${{ runner.temp }}/app_dir_listing.txt
           retention-days: 7
