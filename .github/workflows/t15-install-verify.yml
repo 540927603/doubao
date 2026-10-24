@@ -1,0 +1,216 @@
+# test15 安装器产物真实验证 workflow(由服务器推送/触发, 独立于构建链路)
+#
+# 目的: 在真实 Windows 上静默安装代理品牌产物, 拿安装日志 + 落地结果的一手证据,
+#       不再依赖"代码看起来对"。用户侧反复反馈"客户端 exe 无品牌/注册缺代理信息"
+#       的根因定位专用。
+# 触发: 服务器 workflow_dispatch 下发 inputs
+# 验证项:
+#   0) 下载产物完整性(大小 + 尾部品牌 trailer 字节存在)
+#   1) {app} 内客户端 exe 按品牌改名(<品牌名>.exe), 旧名 doubaoClient.exe 不存在
+#   2) {app}\brand.json 存在且 agent_code/app_name 正确(客户端 brand.py 第一优先级)
+#   3) 客户端 exe 尾部有品牌 trailer(brand.py read_brand_tail 同规则逐字节解析)
+#   4) 客户端 exe VersionInfo 品牌化(ProductName/FileDescription/FileVersion)
+#   5) Chromium 落地约定路径 ms-playwright\chromium-1134\chrome-win(64)\chrome.exe
+#   6) 卸载注册表 DisplayName = 品牌名
+# 证据: Inno /LOG 完整安装日志 + 校验报告 + {app} 目录清单 全部传 GH artifact
+
+name: t15-install-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'test15 站点地址(示例 https://test15.5ghcy.com)'
+        required: true
+      agent_token:
+        description: '代理下载令牌(服务器临时签发, 短 TTL)'
+        required: true
+      build_id:
+        description: '要验证的 agent builds.id'
+        required: true
+      expect_app_name:
+        description: '期望的品牌应用名(示例 豆包厉害工作台)'
+        required: true
+      expect_agent_code:
+        description: '期望 agent_code'
+        required: false
+        default: 'AGAE3AVH'
+      expect_version:
+        description: '期望版本号(示例 1.0.13)'
+        required: false
+        default: ''
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download installer artifact
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dst = 'installer.exe'
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "download try $i ..."
+            curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 `
+              -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+            $sz = (Test-Path $dst) ? (Get-Item $dst).Length : 0
+            Write-Host "curl exit=$LASTEXITCODE size=$sz"
+            if ($LASTEXITCODE -eq 0 -and $sz -gt 100MB) { $ok = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw '安装包下载失败/不完整(<100MB)' }
+          # 完整性: 尾部品牌 trailer 必须字节级存在(服务器注入层)
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $dst))
+          $read = [int][Math]::Min(2MB, $fs.Length)
+          $fs.Seek($fs.Length - $read, 'Begin') | Out-Null
+          $tail = New-Object byte[] $read
+          [void]$fs.Read($tail, 0, $read)
+          $fs.Close()
+          $txt = [System.Text.Encoding]::GetEncoding(28591).GetString($tail)
+          $mark = '<<<T15BRAND_V1>>>'
+          if ($txt.LastIndexOf($mark) -lt 0) { throw '安装器尾部未找到品牌 trailer(服务器注入层失败?)' }
+          Write-Host "下载产物 OK: size=$sz, 尾部品牌 trailer 存在"
+
+      - name: Run installer (VERYSILENT with full log)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 't15_install.log'
+          $p = Start-Process -FilePath (Resolve-Path 'installer.exe') `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" `
+            -Wait -PassThru
+          Write-Host "installer exit code = $($p.ExitCode)"
+          if (Test-Path $log) {
+            Write-Host '--- 安装日志最后 300 行 ---'
+            Get-Content $log -Tail 300 | Write-Host
+          } else {
+            Write-Host '!! 未生成安装日志'
+          }
+          if ($p.ExitCode -ne 0) { throw "安装器退出码 $($p.ExitCode)" }
+
+      - name: Verify branding outcome
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+          EXPECT_AGENT_CODE: ${{ inputs.expect_agent_code }}
+          EXPECT_VERSION: ${{ inputs.expect_version }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $script:failed = $false
+          $script:report = @()
+          function Add-Check([string]$name, [bool]$ok, [string]$detail) {
+            $tag = $(if ($ok) { 'PASS' } else { 'FAIL' })
+            $script:report += ('[{0}] {1} :: {2}' -f $tag, $name, $detail)
+            if (-not $ok) { $script:failed = $true }
+          }
+
+          Write-Host "--- {app} 目录清单 ---"
+          Get-ChildItem -LiteralPath $app -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+          # 1) 客户端 exe 按品牌改名
+          $brandExe = Join-Path $app "$env:EXPECT_APP_NAME.exe"
+          Add-Check '客户端 exe 按品牌改名' (Test-Path -LiteralPath $brandExe) $brandExe
+          $oldExe = Join-Path $app 'doubaoClient.exe'
+          Add-Check '旧名 doubaoClient.exe 已不存在' (-not (Test-Path -LiteralPath $oldExe)) $oldExe
+
+          # 2) brand.json(客户端 brand.py 第一优先级)
+          $bj = Join-Path $app 'brand.json'
+          if (Test-Path -LiteralPath $bj) {
+            $brand = Get-Content -LiteralPath $bj -Raw -Encoding UTF8 | ConvertFrom-Json
+            $okCode = ($brand.agent_code -eq $env:EXPECT_AGENT_CODE)
+            if ($env:EXPECT_VERSION -ne '') { $okCode = $okCode -and ($brand.version -eq $env:EXPECT_VERSION) }
+            Add-Check 'brand.json 内容' $okCode `
+              ("agent_code={0} app_name={1} version={2} api_base={3}" -f `
+               $brand.agent_code, $brand.app_name, $brand.version, $brand.api_base)
+          } else {
+            Add-Check 'brand.json 存在' $false $bj
+          }
+
+          # 3) 客户端 exe 尾部 trailer(与 app/brand.py read_brand_tail 同规则: 标记+CRC)
+          if (Test-Path -LiteralPath $brandExe) {
+            $fs = [System.IO.File]::OpenRead($brandExe)
+            $read = [int][Math]::Min(2MB, $fs.Length)
+            $fs.Seek($fs.Length - $read, 'Begin') | Out-Null
+            $tail = New-Object byte[] $read
+            [void]$fs.Read($tail, 0, $read)
+            $fs.Close()
+            $enc = [System.Text.Encoding]::GetEncoding(28591)
+            $txt = $enc.GetString($tail)
+            $m1 = '<<<T15BRAND_V1>>>'
+            $m2 = '<<<T15BRAND_END>>>'
+            $pos = $txt.LastIndexOf($m1)
+            if ($pos -ge 0) {
+              $end = $txt.IndexOf($m2, $pos)
+              $jsonBytes = $enc.GetBytes($txt.Substring($pos + $m1.Length, $end - $pos - $m1.Length))
+              $crcHex = $txt.Substring($end + $m2.Length, 8)
+              # CRC32(与 zlib.crc32 一致)
+              $table = New-Object 'System.UInt32[]' 256
+              for ($i = 0; $i -lt 256; $i++) {
+                $c = [uint32]$i
+                for ($j = 0; $j -lt 8; $j++) {
+                  if ($c -band 1) { $c = [uint32]([uint32]0xEDB88320 -bxor ($c -shr 1)) } else { $c = [uint32]($c -shr 1) }
+                }
+                $table[$i] = $c
+              }
+              $crc = [uint32]0xFFFFFFFF
+              foreach ($b in $jsonBytes) {
+                $crc = [uint32]($table[($crc -bxor $b) -band 0xFF] -bxor ($crc -shr 8))
+              }
+              $crc = [uint32]($crc -bxor [uint32]0xFFFFFFFF)
+              $calc = '{0:x8}' -f $crc
+              $b2 = [System.Text.Encoding]::UTF8.GetString($jsonBytes) | ConvertFrom-Json
+              $okT = ($calc -eq $crcHex.ToLowerInvariant()) -and ($b2.agent_code -eq $env:EXPECT_AGENT_CODE)
+              Add-Check '客户端 exe 尾部 trailer(CRC+agent_code)' $okT `
+                ("crc={0}/{1} agent_code={2} app_name={3}" -f $calc, $crcHex, $b2.agent_code, $b2.app_name)
+            } else {
+              Add-Check '客户端 exe 尾部 trailer' $false '未找到 <<<T15BRAND_V1>>> 标记'
+            }
+
+            # 4) VersionInfo 品牌化(资源管理器悬停/属性页数据源)
+            $vi = (Get-Item -LiteralPath $brandExe).VersionInfo
+            $okVi = ($vi.ProductName -eq $env:EXPECT_APP_NAME) -and ($vi.FileDescription -eq $env:EXPECT_APP_NAME)
+            if ($env:EXPECT_VERSION -ne '') { $okVi = $okVi -and ($vi.ProductVersion -eq $env:EXPECT_VERSION) }
+            Add-Check '客户端 exe VersionInfo' $okVi `
+              ("ProductName={0} FileDescription={1} ProductVersion={2} FileVersion={3}" -f `
+               $vi.ProductName, $vi.FileDescription, $vi.ProductVersion, $vi.FileVersion)
+          }
+
+          # 5) Chromium 落地约定路径
+          $chrome1 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win\chrome.exe'
+          $chrome2 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win64\chrome.exe'
+          Add-Check 'Chromium 落地约定路径' ((Test-Path $chrome1) -or (Test-Path $chrome2)) $chrome1
+
+          # 6) 卸载注册表 DisplayName = 品牌名
+          $un = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{9A6F2C41-3D7E-4B5A-8F0C-1D2E3B4C5A6B}_is1' -ErrorAction SilentlyContinue
+          Add-Check '卸载表 DisplayName=品牌名' ($un.DisplayName -eq $env:EXPECT_APP_NAME) "DisplayName=$($un.DisplayName)"
+
+          Write-Host ''
+          Write-Host '========== 验证报告 =========='
+          $script:report | Write-Host
+          $rp = Join-Path $env:RUNNER_TEMP 'verify_report.txt'
+          $script:report | Out-File -FilePath $rp -Encoding utf8
+          Get-ChildItem -LiteralPath $app -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table | Out-String | Out-File `
+            (Join-Path $env:RUNNER_TEMP 'app_dir_listing.txt') -Encoding utf8
+          if ($script:failed) { throw '存在 FAIL 项, 根因详见上方报告与安装日志' }
+          Write-Host '全部验证项 PASS'
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-verify-evidence
+          path: |
+            ${{ runner.temp }}/t15_install.log
+            ${{ runner.temp }}/verify_report.txt
+            ${{ runner.temp }}/app_dir_listing.txt
+          retention-days: 7
+          if-no-files-found: ignore
