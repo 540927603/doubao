@@ -1,20 +1,19 @@
-# t15 品牌解析诊断 workflow: 在真实 Windows PowerShell 5.1 环境下逐阶段插桩复跑
-# brand_reader.ps1 的完整逻辑, 定位"真机退出码1"的精确失败点。
-# 背景: 安装器尾部 trailer 字节级校验服务端通过(标记/CRC/JSON/base64/ICO 全有效),
-#       但同一安装器在真机上 brand_reader.ps1 退出码非0(安装日志: 无品牌名称/无trailer)。
+# t15 品牌解析诊断 workflow: 在真实 Windows PowerShell 5.1 下逐阶段插桩复跑
+# brand_reader.ps1 逻辑, 定位真机退出码1的精确失败点。
+# 诊断脚本以 base64 内嵌(避免 YAML/PowerShell 引号与缩进冲突), 运行时解码落盘。
 name: t15-brand-diag
 
 on:
   workflow_dispatch:
     inputs:
       site_url:
-        description: 'test15 站点地址'
+        description: "test15 站点地址"
         required: true
       agent_token:
-        description: '代理下载令牌(短TTL)'
+        description: "代理下载令牌(短TTL)"
         required: true
       build_id:
-        description: 'builds.id'
+        description: "builds.id"
         required: true
 
 jobs:
@@ -29,10 +28,9 @@ jobs:
           AGENT_TOKEN: ${{ inputs.agent_token }}
           BUILD_ID: ${{ inputs.build_id }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $dst = 'installer.exe'
-          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 `
-            -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+          $ErrorActionPreference = "Stop"
+          $dst = "installer.exe"
+          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
           $sz = (Get-Item $dst).Length
           Write-Host "downloaded size=$sz"
           if ($LASTEXITCODE -ne 0 -or $sz -lt 100MB) { throw "下载失败 size=$sz exit=$LASTEXITCODE" }
@@ -40,150 +38,18 @@ jobs:
       - name: Run staged diagnosis under Windows PowerShell 5.1
         shell: pwsh
         run: |
-          # ── 生成与 client-src/installer/brand_reader.ps1 逐行同构的插桩版 ──
-          $diag = @'
-param(
-    [Parameter(Mandatory = $true)][string]$ExePath,
-    [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$AppendToExe = ''
-)
-$ErrorActionPreference = 'Stop'
-$TraceFile = Join-Path $OutDir 'brand_trace.log'
-function Trace([string]$msg) {
-    Add-Content -LiteralPath $TraceFile -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $msg) -Encoding UTF8
-}
-Trace "PSVersion=$($PSVersionTable.PSVersion) ExePath=$ExePath OutDir=$OutDir"
-Trace "CLR=$([System.Environment]::Version)"
-
-$MarkV1 = '<<<T15BRAND_V1>>>'
-$MarkEnd = '<<<T15BRAND_END>>>'
-
-# ---- CRC32(与 brand_reader.ps1 逐字符一致) ----
-function New-Crc32Table {
-    $table = New-Object 'System.UInt32[]' 256
-    for ($i = 0; $i -lt 256; $i++) {
-        $c = [uint32]$i
-        for ($j = 0; $j -lt 8; $j++) {
-            if ($c -band 1) { $c = [uint32]([uint32]0xEDB88320 -bxor ($c -shr 1)) }
-            else { $c = [uint32]($c -shr 1) }
-        }
-        $table[$i] = $c
-    }
-    return $table
-}
-$script:CrcTable = New-Crc32Table
-Trace "table[1]=$($script:CrcTable[1]) (期望=0x77073096=1995958934) table[255]=$($script:CrcTable[255]) (期望=0x2D02EF8D=757167758)"
-
-function Get-Crc32([byte[]]$bytes) {
-    $crc = [uint32]0xFFFFFFFF
-    foreach ($b in $bytes) {
-        $crc = [uint32]($script:CrcTable[($crc -bxor $b) -band 0xFF] -bxor ($crc -shr 8))
-    }
-    return [uint32]($crc -bxor [uint32]0xFFFFFFFF)
-}
-
-# 标准测试向量: CRC32("123456789") 必须等于 cbf43926
-$vec = [System.Text.Encoding]::ASCII.GetBytes('123456789')
-$vecCrc = '{0:x8}' -f (Get-Crc32 $vec)
-Trace "CRC32(123456789)=$vecCrc (期望=cbf43926)"
-
-try {
-    Trace "stage1 Test-Path..."
-    if (-not (Test-Path -LiteralPath $ExePath)) { Trace "FAIL: ExePath 不存在"; exit 1 }
-    Trace "stage1 OK"
-
-    Trace "stage2 读尾部 2MB..."
-    $fs = [System.IO.File]::OpenRead($ExePath)
-    try {
-        $tailMax = 2MB
-        $len = $fs.Length
-        $read = [int][Math]::Min($tailMax, $len)
-        Trace "stage2 len=$len read=$read tailMax=$($tailMax.GetType().Name)"
-        $fs.Seek($len - $read, 'Begin') | Out-Null
-        $tail = New-Object byte[] $read
-        $n = $fs.Read($tail, 0, $read)
-        Trace "stage2 Read返回 n=$n (期望=$read)"
-    } finally { $fs.Close() }
-    Trace "stage2 OK bytes=$($tail.Length)"
-
-    Trace "stage3 ISO-8859-1 解码..."
-    $encByte = [System.Text.Encoding]::GetEncoding(28591)
-    $tailStr = $encByte.GetString($tail)
-    Trace "stage3 tailStr.Length=$($tailStr.Length) (期望=$($tail.Length))"
-    Trace "stage3 OK"
-
-    Trace "stage4 找 V1 标记..."
-    $pos = $tailStr.LastIndexOf($MarkV1, [System.StringComparison]::Ordinal)
-    Trace "stage4 pos=$pos (PHP基准=1934189)"
-    if ($pos -lt 0) { Trace "FAIL: 无 V1 标记"; exit 1 }
-
-    $end = $tailStr.IndexOf($MarkEnd, $pos, [System.StringComparison]::Ordinal)
-    Trace "stage4 end=$end (PHP基准=2097125)"
-    if ($end -lt 0) { Trace "FAIL: 无 END 标记"; exit 1 }
-
-    $jsonStart = $pos + $MarkV1.Length
-    $json = $tailStr.Substring($jsonStart, $end - $jsonStart)
-    $crcHex = $tailStr.Substring($end + $MarkEnd.Length, 8)
-    Trace "stage4 json.Length=$($json.Length) (PHP基准=162919) crcHex=$crcHex"
-
-    Trace "stage5 CRC 校验..."
-    $jsonBytes = $encByte.GetBytes($json)
-    Trace "stage5 jsonBytes.Length=$($jsonBytes.Length) (期望=162919)"
-    $calc = ('{0:x8}' -f (Get-Crc32 $jsonBytes))
-    Trace "stage5 calc=$calc file=$($crcHex.ToLowerInvariant()) 相等=$($calc -eq $crcHex.ToLowerInvariant())"
-    if ($calc -ne $crcHex.ToLowerInvariant()) { Trace "FAIL: CRC 不匹配"; exit 1 }
-
-    Trace "stage6 UTF8 解码 + ConvertFrom-Json..."
-    $jsonText = [System.Text.Encoding]::UTF8.GetString($jsonBytes)
-    $brand = $jsonText | ConvertFrom-Json
-    if (-not $brand) { Trace "FAIL: ConvertFrom-Json 返回空"; exit 1 }
-    Trace "stage6 OK app_name=$($brand.app_name) agent_code=$($brand.agent_code) version=$($brand.version) icon_b64_len=$([string]$brand.icon_ico_b64).Length"
-
-    Trace "stage7 写 brand.json..."
-    [System.IO.File]::WriteAllBytes((Join-Path $OutDir 'brand.json'), $jsonBytes)
-    Trace "stage7 OK"
-
-    Trace "stage8 写 brand.ini..."
-    $ini = "[brand]`r`n" +
-        ('app_name={0}' -f $brand.app_name) + "`r`n" +
-        ('agent_code={0}' -f $brand.agent_code) + "`r`n" +
-        ('version={0}' -f $brand.version) + "`r`n" +
-        ('has_logo={0}' -f [bool]($brand.icon_ico_b64)) + "`r`n"
-    $ini | Out-File -FilePath (Join-Path $OutDir 'brand.ini') -Encoding Unicode
-    Trace "stage8 OK"
-
-    Trace "stage9 写 brand.ico..."
-    if ($brand.icon_ico_b64) {
-        [System.IO.File]::WriteAllBytes((Join-Path $OutDir 'brand.ico'),
-            [Convert]::FromBase64String([string]$brand.icon_ico_b64))
-    }
-    Trace "stage9 OK"
-
-    Trace "ALL STAGES PASS"
-    exit 0
-} catch {
-    Trace ("EXCEPTION: " + $_.Exception.GetType().FullName + " :: " + $_.Exception.Message)
-    Trace ("AT: " + $_.InvocationInfo.PositionMessage)
-    exit 1
-}
-'@
-          Set-Content -LiteralPath 'diag.ps1' -Value $diag -Encoding UTF8
-          New-Item -ItemType Directory -Force -Path 'diagout' | Out-Null
-
-          Write-Host '=== 在 Windows PowerShell 5.1 下运行插桩诊断 ==='
-          $p = Start-Process -FilePath 'powershell.exe' `
-            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', (Resolve-Path 'diag.ps1').Path, `
-              '-ExePath', (Resolve-Path 'installer.exe').Path, '-OutDir', (Resolve-Path 'diagout').Path `
-            -Wait -PassThru -NoNewWindow
+          $ErrorActionPreference = "Stop"
+          [IO.File]::WriteAllBytes("diag.ps1", [Convert]::FromBase64String("cGFyYW0oCiAgICBbUGFyYW1ldGVyKE1hbmRhdG9yeSA9ICR0cnVlKV1bc3RyaW5nXSRFeGVQYXRoLAogICAgW1BhcmFtZXRlcihNYW5kYXRvcnkgPSAkdHJ1ZSldW3N0cmluZ10kT3V0RGlyLAogICAgW3N0cmluZ10kQXBwZW5kVG9FeGUgPSAnJwopCiRFcnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKJFRyYWNlRmlsZSA9IEpvaW4tUGF0aCAkT3V0RGlyICdicmFuZF90cmFjZS5sb2cnCmZ1bmN0aW9uIFRyYWNlKFtzdHJpbmddJG1zZykgewogICAgQWRkLUNvbnRlbnQgLUxpdGVyYWxQYXRoICRUcmFjZUZpbGUgLVZhbHVlICgiW3swfV0gezF9IiAtZiAoR2V0LURhdGUgLUZvcm1hdCAnSEg6bW06c3MuZmZmJyksICRtc2cpIC1FbmNvZGluZyBVVEY4Cn0KVHJhY2UgIlBTVmVyc2lvbj0kKCRQU1ZlcnNpb25UYWJsZS5QU1ZlcnNpb24pIEV4ZVBhdGg9JEV4ZVBhdGggT3V0RGlyPSRPdXREaXIiClRyYWNlICJDTFI9JChbU3lzdGVtLkVudmlyb25tZW50XTo6VmVyc2lvbikiCgokTWFya1YxID0gJzw8PFQxNUJSQU5EX1YxPj4+JwokTWFya0VuZCA9ICc8PDxUMTVCUkFORF9FTkQ+Pj4nCgojIC0tLS0gQ1JDMzIo5LiOIGJyYW5kX3JlYWRlci5wczEg6YCQ5a2X56ym5LiA6Ie0KSAtLS0tCmZ1bmN0aW9uIE5ldy1DcmMzMlRhYmxlIHsKICAgICR0YWJsZSA9IE5ldy1PYmplY3QgJ1N5c3RlbS5VSW50MzJbXScgMjU2CiAgICBmb3IgKCRpID0gMDsgJGkgLWx0IDI1NjsgJGkrKykgewogICAgICAgICRjID0gW3VpbnQzMl0kaQogICAgICAgIGZvciAoJGogPSAwOyAkaiAtbHQgODsgJGorKykgewogICAgICAgICAgICBpZiAoJGMgLWJhbmQgMSkgeyAkYyA9IFt1aW50MzJdKFt1aW50MzJdMHhFREI4ODMyMCAtYnhvciAoJGMgLXNociAxKSkgfQogICAgICAgICAgICBlbHNlIHsgJGMgPSBbdWludDMyXSgkYyAtc2hyIDEpIH0KICAgICAgICB9CiAgICAgICAgJHRhYmxlWyRpXSA9ICRjCiAgICB9CiAgICByZXR1cm4gJHRhYmxlCn0KJHNjcmlwdDpDcmNUYWJsZSA9IE5ldy1DcmMzMlRhYmxlClRyYWNlICJ0YWJsZVsxXT0kKCRzY3JpcHQ6Q3JjVGFibGVbMV0pICjmnJ/mnJsgMTk5NTk1ODkzNCkgdGFibGVbMjU1XT0kKCRzY3JpcHQ6Q3JjVGFibGVbMjU1XSkgKOacn+acmyA3NTcxNjc3NTgpIgoKZnVuY3Rpb24gR2V0LUNyYzMyKFtieXRlW11dJGJ5dGVzKSB7CiAgICAkY3JjID0gW3VpbnQzMl0weEZGRkZGRkZGCiAgICBmb3JlYWNoICgkYiBpbiAkYnl0ZXMpIHsKICAgICAgICAkY3JjID0gW3VpbnQzMl0oJHNjcmlwdDpDcmNUYWJsZVsoJGNyYyAtYnhvciAkYikgLWJhbmQgMHhGRl0gLWJ4b3IgKCRjcmMgLXNociA4KSkKICAgIH0KICAgIHJldHVybiBbdWludDMyXSgkY3JjIC1ieG9yIFt1aW50MzJdMHhGRkZGRkZGRikKfQoKIyDmoIflh4bmtYvor5XlkJHph486IENSQzMyKCIxMjM0NTY3ODkiKSDlv4XpobvnrYnkuo4gY2JmNDM5MjYKJHZlYyA9IFtTeXN0ZW0uVGV4dC5FbmNvZGluZ106OkFTQ0lJLkdldEJ5dGVzKCcxMjM0NTY3ODknKQokdmVjQ3JjID0gJ3swOng4fScgLWYgKEdldC1DcmMzMiAkdmVjKQpUcmFjZSAiQ1JDMzIoMTIzNDU2Nzg5KT0kdmVjQ3JjICjmnJ/mnJsgY2JmNDM5MjYpIgoKdHJ5IHsKICAgIFRyYWNlICJzdGFnZTEgVGVzdC1QYXRoLi4uIgogICAgaWYgKC1ub3QgKFRlc3QtUGF0aCAtTGl0ZXJhbFBhdGggJEV4ZVBhdGgpKSB7IFRyYWNlICJGQUlMOiBFeGVQYXRoIOS4jeWtmOWcqCI7IGV4aXQgMSB9CiAgICBUcmFjZSAic3RhZ2UxIE9LIgoKICAgIFRyYWNlICJzdGFnZTIg6K+75bC+6YOoIDJNQi4uLiIKICAgICRmcyA9IFtTeXN0ZW0uSU8uRmlsZV06Ok9wZW5SZWFkKCRFeGVQYXRoKQogICAgdHJ5IHsKICAgICAgICAkdGFpbE1heCA9IDJNQgogICAgICAgICRsZW4gPSAkZnMuTGVuZ3RoCiAgICAgICAgJHJlYWQgPSBbaW50XVtNYXRoXTo6TWluKCR0YWlsTWF4LCAkbGVuKQogICAgICAgIFRyYWNlICJzdGFnZTIgbGVuPSRsZW4gcmVhZD0kcmVhZCB0YWlsTWF4VHlwZT0kKCR0YWlsTWF4LkdldFR5cGUoKS5OYW1lKSIKICAgICAgICAkZnMuU2VlaygkbGVuIC0gJHJlYWQsICdCZWdpbicpIHwgT3V0LU51bGwKICAgICAgICAkdGFpbCA9IE5ldy1PYmplY3QgYnl0ZVtdICRyZWFkCiAgICAgICAgJG4gPSAkZnMuUmVhZCgkdGFpbCwgMCwgJHJlYWQpCiAgICAgICAgVHJhY2UgInN0YWdlMiBSZWFk6L+U5ZueIG49JG4gKOacn+acmyAkcmVhZCkiCiAgICB9IGZpbmFsbHkgeyAkZnMuQ2xvc2UoKSB9CiAgICBUcmFjZSAic3RhZ2UyIE9LIGJ5dGVzPSQoJHRhaWwuTGVuZ3RoKSIKCiAgICBUcmFjZSAic3RhZ2UzIElTTy04ODU5LTEg6Kej56CBLi4uIgogICAgJGVuY0J5dGUgPSBbU3lzdGVtLlRleHQuRW5jb2RpbmddOjpHZXRFbmNvZGluZygyODU5MSkKICAgICR0YWlsU3RyID0gJGVuY0J5dGUuR2V0U3RyaW5nKCR0YWlsKQogICAgVHJhY2UgInN0YWdlMyB0YWlsU3RyLkxlbmd0aD0kKCR0YWlsU3RyLkxlbmd0aCkgKOacn+acmyAkKCR0YWlsLkxlbmd0aCkpIgogICAgVHJhY2UgInN0YWdlMyBPSyIKCiAgICBUcmFjZSAic3RhZ2U0IOaJviBWMSDmoIforrAuLi4iCiAgICAkcG9zID0gJHRhaWxTdHIuTGFzdEluZGV4T2YoJE1hcmtWMSwgW1N5c3RlbS5TdHJpbmdDb21wYXJpc29uXTo6T3JkaW5hbCkKICAgIFRyYWNlICJzdGFnZTQgcG9zPSRwb3MgKFBIUOWfuuWHhiAxOTM0MTg5KSIKICAgIGlmICgkcG9zIC1sdCAwKSB7IFRyYWNlICJGQUlMOiDml6AgVjEg5qCH6K6wIjsgZXhpdCAxIH0KCiAgICAkZW5kID0gJHRhaWxTdHIuSW5kZXhPZigkTWFya0VuZCwgJHBvcywgW1N5c3RlbS5TdHJpbmdDb21wYXJpc29uXTo6T3JkaW5hbCkKICAgIFRyYWNlICJzdGFnZTQgZW5kPSRlbmQgKFBIUOWfuuWHhiAyMDk3MTI1KSIKICAgIGlmICgkZW5kIC1sdCAwKSB7IFRyYWNlICJGQUlMOiDml6AgRU5EIOagh+iusCI7IGV4aXQgMSB9CgogICAgJGpzb25TdGFydCA9ICRwb3MgKyAkTWFya1YxLkxlbmd0aAogICAgJGpzb24gPSAkdGFpbFN0ci5TdWJzdHJpbmcoJGpzb25TdGFydCwgJGVuZCAtICRqc29uU3RhcnQpCiAgICAkY3JjSGV4ID0gJHRhaWxTdHIuU3Vic3RyaW5nKCRlbmQgKyAkTWFya0VuZC5MZW5ndGgsIDgpCiAgICBUcmFjZSAic3RhZ2U0IGpzb24uTGVuZ3RoPSQoJGpzb24uTGVuZ3RoKSAoUEhQ5Z+65YeGIDE2MjkxOSkgY3JjSGV4PSRjcmNIZXgiCgogICAgVHJhY2UgInN0YWdlNSBDUkMg5qCh6aqMLi4uIgogICAgJGpzb25CeXRlcyA9ICRlbmNCeXRlLkdldEJ5dGVzKCRqc29uKQogICAgVHJhY2UgInN0YWdlNSBqc29uQnl0ZXMuTGVuZ3RoPSQoJGpzb25CeXRlcy5MZW5ndGgpIgogICAgJGNhbGMgPSAoJ3swOng4fScgLWYgKEdldC1DcmMzMiAkanNvbkJ5dGVzKSkKICAgIFRyYWNlICJzdGFnZTUgY2FsYz0kY2FsYyBmaWxlPSQoJGNyY0hleC5Ub0xvd2VySW52YXJpYW50KCkpIOebuOetiT0kKCRjYWxjIC1lcSAkY3JjSGV4LlRvTG93ZXJJbnZhcmlhbnQoKSkiCiAgICBpZiAoJGNhbGMgLW5lICRjcmNIZXguVG9Mb3dlckludmFyaWFudCgpKSB7IFRyYWNlICJGQUlMOiBDUkMg5LiN5Yy56YWNIjsgZXhpdCAxIH0KCiAgICBUcmFjZSAic3RhZ2U2IFVURjgg6Kej56CBICsgQ29udmVydEZyb20tSnNvbi4uLiIKICAgICRqc29uVGV4dCA9IFtTeXN0ZW0uVGV4dC5FbmNvZGluZ106OlVURjguR2V0U3RyaW5nKCRqc29uQnl0ZXMpCiAgICAkYnJhbmQgPSAkanNvblRleHQgfCBDb252ZXJ0RnJvbS1Kc29uCiAgICBpZiAoLW5vdCAkYnJhbmQpIHsgVHJhY2UgIkZBSUw6IENvbnZlcnRGcm9tLUpzb24g6L+U5Zue56m6IjsgZXhpdCAxIH0KICAgIFRyYWNlICJzdGFnZTYgT0sgYXBwX25hbWU9JCgkYnJhbmQuYXBwX25hbWUpIGFnZW50X2NvZGU9JCgkYnJhbmQuYWdlbnRfY29kZSkgdmVyc2lvbj0kKCRicmFuZC52ZXJzaW9uKSBpY29uTGVuPSQoW3N0cmluZ10kYnJhbmQuaWNvbl9pY29fYjY0KS5MZW5ndGgiCgogICAgVHJhY2UgInN0YWdlNyDlhpkgYnJhbmQuanNvbi4uLiIKICAgIFtTeXN0ZW0uSU8uRmlsZV06OldyaXRlQWxsQnl0ZXMoKEpvaW4tUGF0aCAkT3V0RGlyICdicmFuZC5qc29uJyksICRqc29uQnl0ZXMpCiAgICBUcmFjZSAic3RhZ2U3IE9LIgoKICAgIFRyYWNlICJzdGFnZTgg5YaZIGJyYW5kLmluaS4uLiIKICAgICRpbmkgPSAiW2JyYW5kXWByYG4iICsKICAgICAgICAoJ2FwcF9uYW1lPXswfScgLWYgJGJyYW5kLmFwcF9uYW1lKSArICJgcmBuIiArCiAgICAgICAgKCdhZ2VudF9jb2RlPXswfScgLWYgJGJyYW5kLmFnZW50X2NvZGUpICsgImByYG4iICsKICAgICAgICAoJ3ZlcnNpb249ezB9JyAtZiAkYnJhbmQudmVyc2lvbikgKyAiYHJgbiIgKwogICAgICAgICgnaGFzX2xvZ289ezB9JyAtZiBbYm9vbF0oJGJyYW5kLmljb25faWNvX2I2NCkpICsgImByYG4iCiAgICAkaW5pIHwgT3V0LUZpbGUgLUZpbGVQYXRoIChKb2luLVBhdGggJE91dERpciAnYnJhbmQuaW5pJykgLUVuY29kaW5nIFVuaWNvZGUKICAgIFRyYWNlICJzdGFnZTggT0siCgogICAgVHJhY2UgInN0YWdlOSDlhpkgYnJhbmQuaWNvLi4uIgogICAgaWYgKCRicmFuZC5pY29uX2ljb19iNjQpIHsKICAgICAgICBbU3lzdGVtLklPLkZpbGVdOjpXcml0ZUFsbEJ5dGVzKChKb2luLVBhdGggJE91dERpciAnYnJhbmQuaWNvJyksCiAgICAgICAgICAgIFtDb252ZXJ0XTo6RnJvbUJhc2U2NFN0cmluZyhbc3RyaW5nXSRicmFuZC5pY29uX2ljb19iNjQpKQogICAgfQogICAgVHJhY2UgInN0YWdlOSBPSyIKCiAgICBUcmFjZSAiQUxMIFNUQUdFUyBQQVNTIgogICAgZXhpdCAwCn0gY2F0Y2ggewogICAgVHJhY2UgKCJFWENFUFRJT046ICIgKyAkXy5FeGNlcHRpb24uR2V0VHlwZSgpLkZ1bGxOYW1lICsgIiA6OiAiICsgJF8uRXhjZXB0aW9uLk1lc3NhZ2UpCiAgICBUcmFjZSAoIkFUOiAiICsgJF8uSW52b2NhdGlvbkluZm8uUG9zaXRpb25NZXNzYWdlKQogICAgZXhpdCAxCn0K"))
+          New-Item -ItemType Directory -Force -Path "diagout" | Out-Null
+          $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",(Resolve-Path "diag.ps1").Path,"-ExePath",(Resolve-Path "installer.exe").Path,"-OutDir",(Resolve-Path "diagout").Path -Wait -PassThru -NoNewWindow
           Write-Host "diag exit code = $($p.ExitCode)"
-          Write-Host ''
-          Write-Host '========== brand_trace.log =========='
-          Get-Content 'diagout\brand_trace.log' -ErrorAction SilentlyContinue | Write-Host
-          Write-Host '========== diagout 目录 =========='
-          Get-ChildItem 'diagout' | Select-Object Name, Length | Format-Table | Out-String | Write-Host
-          if (Test-Path 'diagout\brand.ini') {
-            Write-Host '--- brand.ini 内容 ---'
-            Get-Content 'diagout\brand.ini' | Write-Host
+          Write-Host "========== brand_trace.log =========="
+          Get-Content "diagout/brand_trace.log" -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "========== diagout 目录 =========="
+          Get-ChildItem "diagout" | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+          if (Test-Path "diagout/brand.ini") {
+            Write-Host "--- brand.ini 内容 ---"
+            Get-Content "diagout/brand.ini" | Write-Host
           }
 
       - name: Upload diag evidence
@@ -192,9 +58,9 @@ try {
         with:
           name: brand-diag-evidence
           path: |
-            diagout\brand_trace.log
-            diagout\brand.json
-            diagout\brand.ini
-            diagout\brand.ico
+            diagout/brand_trace.log
+            diagout/brand.json
+            diagout/brand.ini
+            diagout/brand.ico
           retention-days: 7
           if-no-files-found: ignore
