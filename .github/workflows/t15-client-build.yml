@@ -75,6 +75,81 @@ jobs:
           Expand-Archive client-src.zip -DestinationPath client-src -Force
           Get-ChildItem client-src | Select-Object Name, Length | Format-Table | Out-String | Write-Host
 
+      # 构建门禁: 用真正的 Windows PowerShell 5.1 跑一遍将要打进安装包的 brand_reader.ps1。
+      # 2026-10-24 教训: 脚本里的 [uint32]0xEDB88320 在 PS5.1 会抛 UInt32 溢出, 而 CI 的
+      # pwsh 7 静默通过 → 主模板"构建成功"但所有安装包品牌链路全废。此步骤失败即中止构建,
+      # 绝不产出装不上品牌的安装包。
+      - name: PS5.1 brand_reader self-test (build gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          if (-not (Test-Path -LiteralPath $ps51)) { throw 'Windows PowerShell 5.1 not found' }
+
+          # 合成安装包: PE 头似的垃圾 + 品牌 trailer; CRC 用 python zlib(权威实现)生成
+          $py = @'
+          import zlib, json, base64
+          brand = {
+              "app_name": "\u8c46\u5305\u6d4b\u8bd5\u54c1\u724c",
+              "agent_code": "AGTEST",
+              "version": "9.9.9",
+              "site_url": "https://example.test",
+              "icon_ico_b64": base64.b64encode(bytes(range(256)) * 2).decode(),
+          }
+          jb = json.dumps(brand, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+          crc = "%08x" % (zlib.crc32(jb) & 0xFFFFFFFF)
+          head = b"MZ" + b"\x00" * 2048
+          open("test_brand.exe", "wb").write(head + b"\n<<<T15BRAND_V1>>>" + jb + b"<<<T15BRAND_END>>>" + crc.encode() + b"\n")
+          open("test_client.exe", "wb").write(head)
+          open("test_expect.json", "wb").write(jb)
+          print("crc", crc, "json_len", len(jb))
+          '@
+          Set-Content -LiteralPath 'make_test.py' -Value $py -Encoding ASCII
+          python make_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'synthetic trailer generation failed' }
+
+          New-Item -ItemType Directory -Force -Path 'ps51out' | Out-Null
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out'
+          $rc = $LASTEXITCODE
+          Write-Host "PS5.1 brand_reader exit=$rc"
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace | ForEach-Object { Write-Host "TRACE $_" } }
+          if ($rc -ne 0) { throw "brand_reader failed under PS5.1 (exit $rc)" }
+
+          foreach ($f in 'brand.json', 'brand.ini', 'brand.ico') {
+            if (-not (Test-Path -LiteralPath (Join-Path 'ps51out' $f))) { throw "missing $f" }
+          }
+          $got = [System.IO.File]::ReadAllBytes((Resolve-Path 'ps51out/brand.json'))
+          $exp = [System.IO.File]::ReadAllBytes((Resolve-Path 'test_expect.json'))
+          if ($got.Length -ne $exp.Length) { throw 'brand.json size mismatch' }
+          for ($i = 0; $i -lt $exp.Length; $i++) {
+            if ($got[$i] -ne $exp[$i]) { throw "brand.json byte mismatch at offset $i" }
+          }
+          $ini = [System.IO.File]::ReadAllText((Resolve-Path 'ps51out/brand.ini'), [System.Text.Encoding]::Unicode)
+          Write-Host "brand.ini => $($ini -replace "`r`n", ' | ')"
+          if ($ini -notmatch 'agent_code=AGTEST') { throw 'brand.ini agent_code wrong' }
+          if ($ini -notmatch ('app_name=' + [char]0x8C46 + [char]0x5305)) { throw 'brand.ini app_name lost non-ASCII' }
+          if ($ini -notmatch 'has_logo=True') { throw 'brand.ini has_logo wrong' }
+          if ((Get-Item 'ps51out/brand.ico').Length -ne 512) { throw 'brand.ico content wrong' }
+
+          # 第二注入通道: trailer 追加到客户端 exe 尾部 (+ 幂等性)
+          New-Item -ItemType Directory -Force -Path 'ps51out2' | Out-Null
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
+          if ($LASTEXITCODE -ne 0) { throw "append channel failed (exit $LASTEXITCODE)" }
+          $before = (Get-Item 'test_client.exe').Length
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
+          if ($LASTEXITCODE -ne 0) { throw "append idempotent run failed (exit $LASTEXITCODE)" }
+          $after = (Get-Item 'test_client.exe').Length
+          if ($before -ne $after) { throw "append not idempotent ($before -> $after)" }
+          $cb = [System.IO.File]::ReadAllBytes((Resolve-Path 'test_client.exe').Path)
+          $stop = $cb.Length
+          $tailLen = [Math]::Min(65536, $stop)
+          $tailBuf = New-Object byte[] $tailLen
+          [Array]::Copy($cb, $stop - $tailLen, $tailBuf, 0, $tailLen)
+          $tailStr = [System.Text.Encoding]::GetEncoding(28591).GetString($tailBuf)
+          if (-not $tailStr.Contains('<<<T15BRAND_V1>>>')) { throw 'appended trailer missing on client exe' }
+          Write-Host 'PS5.1 brand_reader self-test PASS'
+
       - name: Install dependencies
         shell: pwsh
         env:
