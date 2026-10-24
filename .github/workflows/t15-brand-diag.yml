@@ -1,0 +1,200 @@
+# t15 品牌解析诊断 workflow: 在真实 Windows PowerShell 5.1 环境下逐阶段插桩复跑
+# brand_reader.ps1 的完整逻辑, 定位"真机退出码1"的精确失败点。
+# 背景: 安装器尾部 trailer 字节级校验服务端通过(标记/CRC/JSON/base64/ICO 全有效),
+#       但同一安装器在真机上 brand_reader.ps1 退出码非0(安装日志: 无品牌名称/无trailer)。
+name: t15-brand-diag
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'test15 站点地址'
+        required: true
+      agent_token:
+        description: '代理下载令牌(短TTL)'
+        required: true
+      build_id:
+        description: 'builds.id'
+        required: true
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download installer artifact
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dst = 'installer.exe'
+          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 `
+            -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+          $sz = (Get-Item $dst).Length
+          Write-Host "downloaded size=$sz"
+          if ($LASTEXITCODE -ne 0 -or $sz -lt 100MB) { throw "下载失败 size=$sz exit=$LASTEXITCODE" }
+
+      - name: Run staged diagnosis under Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          # ── 生成与 client-src/installer/brand_reader.ps1 逐行同构的插桩版 ──
+          $diag = @'
+param(
+    [Parameter(Mandatory = $true)][string]$ExePath,
+    [Parameter(Mandatory = $true)][string]$OutDir,
+    [string]$AppendToExe = ''
+)
+$ErrorActionPreference = 'Stop'
+$TraceFile = Join-Path $OutDir 'brand_trace.log'
+function Trace([string]$msg) {
+    Add-Content -LiteralPath $TraceFile -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $msg) -Encoding UTF8
+}
+Trace "PSVersion=$($PSVersionTable.PSVersion) ExePath=$ExePath OutDir=$OutDir"
+Trace "CLR=$([System.Environment]::Version)"
+
+$MarkV1 = '<<<T15BRAND_V1>>>'
+$MarkEnd = '<<<T15BRAND_END>>>'
+
+# ---- CRC32(与 brand_reader.ps1 逐字符一致) ----
+function New-Crc32Table {
+    $table = New-Object 'System.UInt32[]' 256
+    for ($i = 0; $i -lt 256; $i++) {
+        $c = [uint32]$i
+        for ($j = 0; $j -lt 8; $j++) {
+            if ($c -band 1) { $c = [uint32]([uint32]0xEDB88320 -bxor ($c -shr 1)) }
+            else { $c = [uint32]($c -shr 1) }
+        }
+        $table[$i] = $c
+    }
+    return $table
+}
+$script:CrcTable = New-Crc32Table
+Trace "table[1]=$($script:CrcTable[1]) (期望=0x77073096=1995958934) table[255]=$($script:CrcTable[255]) (期望=0x2D02EF8D=757167758)"
+
+function Get-Crc32([byte[]]$bytes) {
+    $crc = [uint32]0xFFFFFFFF
+    foreach ($b in $bytes) {
+        $crc = [uint32]($script:CrcTable[($crc -bxor $b) -band 0xFF] -bxor ($crc -shr 8))
+    }
+    return [uint32]($crc -bxor [uint32]0xFFFFFFFF)
+}
+
+# 标准测试向量: CRC32("123456789") 必须等于 cbf43926
+$vec = [System.Text.Encoding]::ASCII.GetBytes('123456789')
+$vecCrc = '{0:x8}' -f (Get-Crc32 $vec)
+Trace "CRC32(123456789)=$vecCrc (期望=cbf43926)"
+
+try {
+    Trace "stage1 Test-Path..."
+    if (-not (Test-Path -LiteralPath $ExePath)) { Trace "FAIL: ExePath 不存在"; exit 1 }
+    Trace "stage1 OK"
+
+    Trace "stage2 读尾部 2MB..."
+    $fs = [System.IO.File]::OpenRead($ExePath)
+    try {
+        $tailMax = 2MB
+        $len = $fs.Length
+        $read = [int][Math]::Min($tailMax, $len)
+        Trace "stage2 len=$len read=$read tailMax=$($tailMax.GetType().Name)"
+        $fs.Seek($len - $read, 'Begin') | Out-Null
+        $tail = New-Object byte[] $read
+        $n = $fs.Read($tail, 0, $read)
+        Trace "stage2 Read返回 n=$n (期望=$read)"
+    } finally { $fs.Close() }
+    Trace "stage2 OK bytes=$($tail.Length)"
+
+    Trace "stage3 ISO-8859-1 解码..."
+    $encByte = [System.Text.Encoding]::GetEncoding(28591)
+    $tailStr = $encByte.GetString($tail)
+    Trace "stage3 tailStr.Length=$($tailStr.Length) (期望=$($tail.Length))"
+    Trace "stage3 OK"
+
+    Trace "stage4 找 V1 标记..."
+    $pos = $tailStr.LastIndexOf($MarkV1, [System.StringComparison]::Ordinal)
+    Trace "stage4 pos=$pos (PHP基准=1934189)"
+    if ($pos -lt 0) { Trace "FAIL: 无 V1 标记"; exit 1 }
+
+    $end = $tailStr.IndexOf($MarkEnd, $pos, [System.StringComparison]::Ordinal)
+    Trace "stage4 end=$end (PHP基准=2097125)"
+    if ($end -lt 0) { Trace "FAIL: 无 END 标记"; exit 1 }
+
+    $jsonStart = $pos + $MarkV1.Length
+    $json = $tailStr.Substring($jsonStart, $end - $jsonStart)
+    $crcHex = $tailStr.Substring($end + $MarkEnd.Length, 8)
+    Trace "stage4 json.Length=$($json.Length) (PHP基准=162919) crcHex=$crcHex"
+
+    Trace "stage5 CRC 校验..."
+    $jsonBytes = $encByte.GetBytes($json)
+    Trace "stage5 jsonBytes.Length=$($jsonBytes.Length) (期望=162919)"
+    $calc = ('{0:x8}' -f (Get-Crc32 $jsonBytes))
+    Trace "stage5 calc=$calc file=$($crcHex.ToLowerInvariant()) 相等=$($calc -eq $crcHex.ToLowerInvariant())"
+    if ($calc -ne $crcHex.ToLowerInvariant()) { Trace "FAIL: CRC 不匹配"; exit 1 }
+
+    Trace "stage6 UTF8 解码 + ConvertFrom-Json..."
+    $jsonText = [System.Text.Encoding]::UTF8.GetString($jsonBytes)
+    $brand = $jsonText | ConvertFrom-Json
+    if (-not $brand) { Trace "FAIL: ConvertFrom-Json 返回空"; exit 1 }
+    Trace "stage6 OK app_name=$($brand.app_name) agent_code=$($brand.agent_code) version=$($brand.version) icon_b64_len=$([string]$brand.icon_ico_b64).Length"
+
+    Trace "stage7 写 brand.json..."
+    [System.IO.File]::WriteAllBytes((Join-Path $OutDir 'brand.json'), $jsonBytes)
+    Trace "stage7 OK"
+
+    Trace "stage8 写 brand.ini..."
+    $ini = "[brand]`r`n" +
+        ('app_name={0}' -f $brand.app_name) + "`r`n" +
+        ('agent_code={0}' -f $brand.agent_code) + "`r`n" +
+        ('version={0}' -f $brand.version) + "`r`n" +
+        ('has_logo={0}' -f [bool]($brand.icon_ico_b64)) + "`r`n"
+    $ini | Out-File -FilePath (Join-Path $OutDir 'brand.ini') -Encoding Unicode
+    Trace "stage8 OK"
+
+    Trace "stage9 写 brand.ico..."
+    if ($brand.icon_ico_b64) {
+        [System.IO.File]::WriteAllBytes((Join-Path $OutDir 'brand.ico'),
+            [Convert]::FromBase64String([string]$brand.icon_ico_b64))
+    }
+    Trace "stage9 OK"
+
+    Trace "ALL STAGES PASS"
+    exit 0
+} catch {
+    Trace ("EXCEPTION: " + $_.Exception.GetType().FullName + " :: " + $_.Exception.Message)
+    Trace ("AT: " + $_.InvocationInfo.PositionMessage)
+    exit 1
+}
+'@
+          Set-Content -LiteralPath 'diag.ps1' -Value $diag -Encoding UTF8
+          New-Item -ItemType Directory -Force -Path 'diagout' | Out-Null
+
+          Write-Host '=== 在 Windows PowerShell 5.1 下运行插桩诊断 ==='
+          $p = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', (Resolve-Path 'diag.ps1').Path, `
+              '-ExePath', (Resolve-Path 'installer.exe').Path, '-OutDir', (Resolve-Path 'diagout').Path `
+            -Wait -PassThru -NoNewWindow
+          Write-Host "diag exit code = $($p.ExitCode)"
+          Write-Host ''
+          Write-Host '========== brand_trace.log =========='
+          Get-Content 'diagout\brand_trace.log' -ErrorAction SilentlyContinue | Write-Host
+          Write-Host '========== diagout 目录 =========='
+          Get-ChildItem 'diagout' | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+          if (Test-Path 'diagout\brand.ini') {
+            Write-Host '--- brand.ini 内容 ---'
+            Get-Content 'diagout\brand.ini' | Write-Host
+          }
+
+      - name: Upload diag evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brand-diag-evidence
+          path: |
+            diagout\brand_trace.log
+            diagout\brand.json
+            diagout\brand.ini
+            diagout\brand.ico
+          retention-days: 7
+          if-no-files-found: ignore
