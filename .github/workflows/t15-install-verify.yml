@@ -195,6 +195,47 @@ jobs:
                $vi.ProductName, $vi.FileDescription, $vi.ProductVersion, $vi.FileVersion)
           }
 
+          # 4.5) 图标资源品牌化(字节级): exe 的每个 RT_ICON 必须来自 brand.ico
+          #      (icon_patch.ps1 用品牌图逐尺寸替换, 任一残留旧图标 = 用户看到默认图标)
+          $icoPath = Join-Path $app 'brand.ico'
+          if ((Test-Path -LiteralPath $brandExe) -and (Test-Path -LiteralPath $icoPath)) {
+            $iconPy = @'
+          import sys, hashlib, struct
+          exe, ico = sys.argv[1], sys.argv[2]
+          data = open(exe, 'rb').read()
+          import pefile
+          pe = pefile.PE(exe, fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+          icons = []
+          for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              if typ.id != 3:
+                  continue
+              for nm in typ.directory.entries:
+                  for lg in nm.directory.entries:
+                      d = lg.data.struct
+                      off = pe.get_offset_from_rva(int(d.OffsetToData))
+                      icons.append(hashlib.sha256(data[off:off + int(d.Size)]).hexdigest())
+          blob = open(ico, 'rb').read()
+          cnt = struct.unpack_from('<H', blob, 4)[0]
+          imgs = []
+          for i in range(cnt):
+              o = 6 + i * 16
+              sz = struct.unpack_from('<I', blob, o + 8)[0]
+              off = struct.unpack_from('<I', blob, o + 12)[0]
+              imgs.append(hashlib.sha256(blob[off:off + sz]).hexdigest())
+          missing = [h for h in icons if h not in imgs]
+          print('exe_icons=%d brand_images=%d missing=%d' % (len(icons), len(imgs), len(missing)))
+          sys.exit(0 if icons and not missing else 2)
+          '@
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'check_icon.py') -Value $iconPy -Encoding ASCII
+            python -m pip install --quiet pefile 2>&1 | Out-Null
+            $outIcon = python (Join-Path $env:RUNNER_TEMP 'check_icon.py') $brandExe $icoPath 2>&1
+            $iconRc = $LASTEXITCODE
+            Add-Check '客户端 exe 图标=品牌 logo(字节级)' ($iconRc -eq 0) (($outIcon | Out-String).Trim())
+          } else {
+            Add-Check '客户端 exe 图标=品牌 logo(字节级)' $false "missing client exe or brand.ico"
+          }
+
           # 5) Chromium 落地约定路径
           $chrome1 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win\chrome.exe'
           $chrome2 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win64\chrome.exe'
@@ -248,35 +289,35 @@ jobs:
           }
           python -m pip install --quiet pefile 2>&1 | Out-Null
           $py = @'
-import json, sys
-import pefile
+          import json, sys
+          import pefile
 
-path = sys.argv[1]
-data = open(path, 'rb').read()
-pe = pefile.PE(path, fast_load=True)
-pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-rows = []
-for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
-    tname = typ.id if typ.id is not None else str(typ.name)
-    for nm in typ.directory.entries:
-        nname = nm.id if nm.id is not None else str(nm.name)
-        for lg in nm.directory.entries:
-            lname = lg.id if lg.id is not None else str(lg.name)
-            d = lg.data.struct
-            rows.append({'type': tname, 'name': nname, 'lang': lname,
-                         'rva': int(d.OffsetToData), 'size': int(d.Size)})
-print(json.dumps(rows, ensure_ascii=False, indent=1))
-print('FILESIZE=%d' % len(data))
-for row in rows:
-    if row['type'] != 16:
-        continue
-    off = pe.get_offset_from_rva(row['rva'])
-    blob = data[off:off + row['size']]
-    print('RT_VERSION name=%s lang=%s size=%d fileoffset=%d' % (row['name'], row['lang'], row['size'], off))
-    for kw in ('VS_VERSION_INFO', 'StringFileInfo', 'StringTable', '080404b0', '040904b0',
-               'ProductName', 'FileDescription', '2052', '1033'):
-        print('  contains %-16s : %s' % (kw, kw.encode('utf-16-le') in blob))
-'@
+          path = sys.argv[1]
+          data = open(path, 'rb').read()
+          pe = pefile.PE(path, fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+          rows = []
+          for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              tname = typ.id if typ.id is not None else str(typ.name)
+              for nm in typ.directory.entries:
+                  nname = nm.id if nm.id is not None else str(nm.name)
+                  for lg in nm.directory.entries:
+                      lname = lg.id if lg.id is not None else str(lg.name)
+                      d = lg.data.struct
+                      rows.append({'type': tname, 'name': nname, 'lang': lname,
+                                   'rva': int(d.OffsetToData), 'size': int(d.Size)})
+          print(json.dumps(rows, ensure_ascii=False, indent=1))
+          print('FILESIZE=%d' % len(data))
+          for row in rows:
+              if row['type'] != 16:
+                  continue
+              off = pe.get_offset_from_rva(row['rva'])
+              blob = data[off:off + row['size']]
+              print('RT_VERSION name=%s lang=%s size=%d fileoffset=%d' % (row['name'], row['lang'], row['size'], off))
+              for kw in ('VS_VERSION_INFO', 'StringFileInfo', 'StringTable', '080404b0', '040904b0',
+                         'ProductName', 'FileDescription', '2052', '1033'):
+                  print('  contains %-16s : %s' % (kw, kw.encode('utf-16-le') in blob))
+          '@
           Set-Content -LiteralPath 'forensics\dump_res.py' -Value $py -Encoding ASCII
           if (Test-Path -LiteralPath $exe) {
             python 'forensics\dump_res.py' $exe 2>&1 | Tee-Object -FilePath 'forensics\resources.txt'
