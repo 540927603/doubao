@@ -152,21 +152,32 @@ jobs:
               $end = $txt.IndexOf($m2, $pos)
               $jsonBytes = $enc.GetBytes($txt.Substring($pos + $m1.Length, $end - $pos - $m1.Length))
               $crcHex = $txt.Substring($end + $m2.Length, 8)
-              # CRC32(与 zlib.crc32 一致)
+              # CRC32(与 zlib.crc32 一致) —— 必须全程 uint64 运算:
+              # PowerShell(5.1/7 都一样)把 0xEDB88320 解析成负 Int32(-306674912),
+              # 直接 [uint32] 强转会抛 "Cannot convert value -306674912",
+              # 导致 CRC 校验假失败(crc=0000003f)而 trailer 其实完好
+              # (2026-10-24 1.0.16 验证报告误判根因)。算法与 brand_reader.ps1 逐行一致。
+              $poly = [System.UInt32]::Parse('EDB88320', [System.Globalization.NumberStyles]::HexNumber)
+              $mask = [uint64]4294967295
               $table = New-Object 'System.UInt32[]' 256
               for ($i = 0; $i -lt 256; $i++) {
-                $c = [uint32]$i
+                $c = [uint64]$i
                 for ($j = 0; $j -lt 8; $j++) {
-                  if ($c -band 1) { $c = [uint32]([uint32]0xEDB88320 -bxor ($c -shr 1)) } else { $c = [uint32]($c -shr 1) }
+                  if (($c -band [uint64]1) -eq [uint64]1) {
+                    $c = (([uint64]$poly -bxor ($c -shr 1)) -band $mask)
+                  } else {
+                    $c = (($c -shr 1) -band $mask)
+                  }
                 }
-                $table[$i] = $c
+                $table[$i] = [uint32]$c
               }
-              $crc = [uint32]0xFFFFFFFF
+              $crc = [uint64]4294967295
               foreach ($b in $jsonBytes) {
-                $crc = [uint32]($table[($crc -bxor $b) -band 0xFF] -bxor ($crc -shr 8))
+                $idx = [int](($crc -bxor [uint64]$b) -band [uint64]255)
+                $crc = (([uint64]($table[$idx]) -bxor ($crc -shr 8)) -band $mask)
               }
-              $crc = [uint32]($crc -bxor [uint32]0xFFFFFFFF)
-              $calc = '{0:x8}' -f $crc
+              $crc = (($crc -bxor $mask) -band $mask)
+              $calc = '{0:x8}' -f [uint32]$crc
               $b2 = [System.Text.Encoding]::UTF8.GetString($jsonBytes) | ConvertFrom-Json
               $okT = ($calc -eq $crcHex.ToLowerInvariant()) -and ($b2.agent_code -eq $env:EXPECT_AGENT_CODE)
               Add-Check '客户端 exe 尾部 trailer(CRC+agent_code)' $okT `
@@ -203,6 +214,74 @@ jobs:
             (Join-Path $env:RUNNER_TEMP 'app_dir_listing.txt') -Encoding utf8
           if ($script:failed) { throw '存在 FAIL 项, 根因详见上方报告与安装日志' }
           Write-Host '全部验证项 PASS'
+
+      # 资源级取证(2026-10-24): 1.0.16 真机报告里"尾部 trailer CRC"是校验脚本自身
+      # CRC32 溢出造成的假失败; VersionInfo 仍为默认值则是真实失败。这里在卸载前把
+      # 安装后的客户端 exe 完整拷贝出来, 并用 pefile 权威解析资源目录
+      # (type/name/lang/offset/size), 用于离线定位 icon_patch.ps1 的 RT_VERSION 写入落点。
+      - name: Resource forensics (before uninstall)
+        if: always()
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path 'forensics' | Out-Null
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $exe = Join-Path $app "$env:EXPECT_APP_NAME.exe"
+          if (Test-Path -LiteralPath $exe) { Copy-Item -LiteralPath $exe 'forensics\installed_client.exe' -Force }
+          foreach ($n in 'brand.ico', 'brand.json', 'brand.ini') {
+            $p = Join-Path $app $n
+            if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p ('forensics\' + $n) -Force }
+          }
+          if (Test-Path -LiteralPath $exe) {
+            $vi = (Get-Item -LiteralPath $exe).VersionInfo
+            @(
+              "ProductName=$($vi.ProductName)",
+              "FileDescription=$($vi.FileDescription)",
+              "CompanyName=$($vi.CompanyName)",
+              "ProductVersion=$($vi.ProductVersion)",
+              "FileVersion=$($vi.FileVersion)",
+              "OriginalFilename=$($vi.OriginalFilename)",
+              "Language=$($vi.Language)"
+            ) | Set-Content -LiteralPath 'forensics\versioninfo.txt' -Encoding UTF8
+          }
+          python -m pip install --quiet pefile 2>&1 | Out-Null
+          $py = @'
+import json, sys
+import pefile
+
+path = sys.argv[1]
+data = open(path, 'rb').read()
+pe = pefile.PE(path, fast_load=True)
+pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+rows = []
+for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+    tname = typ.id if typ.id is not None else str(typ.name)
+    for nm in typ.directory.entries:
+        nname = nm.id if nm.id is not None else str(nm.name)
+        for lg in nm.directory.entries:
+            lname = lg.id if lg.id is not None else str(lg.name)
+            d = lg.data.struct
+            rows.append({'type': tname, 'name': nname, 'lang': lname,
+                         'rva': int(d.OffsetToData), 'size': int(d.Size)})
+print(json.dumps(rows, ensure_ascii=False, indent=1))
+print('FILESIZE=%d' % len(data))
+for row in rows:
+    if row['type'] != 16:
+        continue
+    off = pe.get_offset_from_rva(row['rva'])
+    blob = data[off:off + row['size']]
+    print('RT_VERSION name=%s lang=%s size=%d fileoffset=%d' % (row['name'], row['lang'], row['size'], off))
+    for kw in ('VS_VERSION_INFO', 'StringFileInfo', 'StringTable', '080404b0', '040904b0',
+               'ProductName', 'FileDescription', '2052', '1033'):
+        print('  contains %-16s : %s' % (kw, kw.encode('utf-16-le') in blob))
+'@
+          Set-Content -LiteralPath 'forensics\dump_res.py' -Value $py -Encoding ASCII
+          if (Test-Path -LiteralPath $exe) {
+            python 'forensics\dump_res.py' $exe 2>&1 | Tee-Object -FilePath 'forensics\resources.txt'
+          }
+          Get-ChildItem 'forensics' | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
 
       # 7) 卸载链路真实验证(2026-10-24 用户实测 unins000 弹 "unknown constant
       #    uninstalldisplayname" 的根因复现): 静默卸载必须退出码 0、无 unknown constant
@@ -260,5 +339,6 @@ jobs:
             ${{ runner.temp }}/t15_uninstall.log
             ${{ runner.temp }}/verify_report.txt
             ${{ runner.temp }}/app_dir_listing.txt
+            forensics/
           retention-days: 7
           if-no-files-found: ignore
