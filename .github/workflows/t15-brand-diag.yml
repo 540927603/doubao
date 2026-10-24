@@ -1,25 +1,30 @@
-# t15 品牌解析诊断 workflow: 在真实 Windows PowerShell 5.1 下逐阶段插桩复跑
-# brand_reader.ps1 逻辑, 定位真机退出码1的精确失败点。
-# 诊断脚本以 base64 内嵌(避免 YAML/PowerShell 引号与缩进冲突), 运行时解码落盘。
+# t15 品牌解析诊断 workflow v2: 直接运行安装包内【真实下发的 brand_reader.ps1】
+# 在 Windows PowerShell 5.1 下复现退出码 1, 同时抓:
+#   1) 安装器自身安装期产生的 %LOCALAPPDATA%\ms-playwright\doubao_brand_reader.log
+#      (脚本内置逐阶段 trace, 失败点直接写在里面)
+#   2) 直接运行下发脚本副本的 stdout/stderr/退出码 (PS5.1 + PS7 双通道对照)
+#   3) 下发脚本前 96 字节 hex dump (核对 BOM/编码/行结尾)
+#   4) diagout 产物(brand.ini/json/ico 是否落盘)
+# 触发: 服务器 workflow_dispatch 下发 inputs
 name: t15-brand-diag
 
 on:
   workflow_dispatch:
     inputs:
       site_url:
-        description: "test15 站点地址"
+        description: 'test15 站点地址'
         required: true
       agent_token:
-        description: "代理下载令牌(短TTL)"
+        description: '代理下载令牌(短TTL)'
         required: true
       build_id:
-        description: "builds.id"
+        description: 'builds.id'
         required: true
 
 jobs:
   diag:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Download installer artifact
         shell: pwsh
@@ -28,32 +33,76 @@ jobs:
           AGENT_TOKEN: ${{ inputs.agent_token }}
           BUILD_ID: ${{ inputs.build_id }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $dst = "installer.exe"
-          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
-          $sz = (Get-Item $dst).Length
-          Write-Host "downloaded size=$sz"
-          if ($LASTEXITCODE -ne 0 -or $sz -lt 100MB) { throw "下载失败 size=$sz exit=$LASTEXITCODE" }
+          $ErrorActionPreference = 'Stop'
+          $dst = 'installer.exe'
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+            $sz = (Test-Path $dst) ? (Get-Item $dst).Length : 0
+            Write-Host "download try $i exit=$LASTEXITCODE size=$sz"
+            if ($LASTEXITCODE -eq 0 -and $sz -gt 100MB) { $ok = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw 'installer download failed (<100MB)' }
 
-      - name: Run staged diagnosis under Windows PowerShell 5.1
+      - name: Run installer silently (captures install-time brand trace)
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          # 2026-10-24: 解码落盘时补 UTF-8 BOM —— PS5.1 对无 BOM 脚本按系统 ANSI(cp1252/GBK)
-          # 解码, 内嵌中文会像 1.0.13 的 brand_reader.ps1 一样炸出 parser error
-          # (run 40055459179 "Try statement missing Catch/Finally" 教训)
-          [IO.File]::WriteAllBytes("diag.ps1", [byte[]](0xEF,0xBB,0xBF) + [Convert]::FromBase64String("cGFyYW0oCiAgICBbUGFyYW1ldGVyKE1hbmRhdG9yeSA9ICR0cnVlKV1bc3RyaW5nXSRFeGVQYXRoLAogICAgW1BhcmFtZXRlcihNYW5kYXRvcnkgPSAkdHJ1ZSldW3N0cmluZ10kT3V0RGlyLAogICAgW3N0cmluZ10kQXBwZW5kVG9FeGUgPSAnJwopCiRFcnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKJFRyYWNlRmlsZSA9IEpvaW4tUGF0aCAkT3V0RGlyICdicmFuZF90cmFjZS5sb2cnCmZ1bmN0aW9uIFRyYWNlKFtzdHJpbmddJG1zZykgewogICAgQWRkLUNvbnRlbnQgLUxpdGVyYWxQYXRoICRUcmFjZUZpbGUgLVZhbHVlICgiW3swfV0gezF9IiAtZiAoR2V0LURhdGUgLUZvcm1hdCAnSEg6bW06c3MuZmZmJyksICRtc2cpIC1FbmNvZGluZyBVVEY4Cn0KVHJhY2UgIlBTVmVyc2lvbj0kKCRQU1ZlcnNpb25UYWJsZS5QU1ZlcnNpb24pIEV4ZVBhdGg9JEV4ZVBhdGggT3V0RGlyPSRPdXREaXIiClRyYWNlICJDTFI9JChbU3lzdGVtLkVudmlyb25tZW50XTo6VmVyc2lvbikiCgokTWFya1YxID0gJzw8PFQxNUJSQU5EX1YxPj4+JwokTWFya0VuZCA9ICc8PDxUMTVCUkFORF9FTkQ+Pj4nCgojIC0tLS0gQ1JDMzIo5LiOIGJyYW5kX3JlYWRlci5wczEg6YCQ5a2X56ym5LiA6Ie0KSAtLS0tCmZ1bmN0aW9uIE5ldy1DcmMzMlRhYmxlIHsKICAgICR0YWJsZSA9IE5ldy1PYmplY3QgJ1N5c3RlbS5VSW50MzJbXScgMjU2CiAgICBmb3IgKCRpID0gMDsgJGkgLWx0IDI1NjsgJGkrKykgewogICAgICAgICRjID0gW3VpbnQzMl0kaQogICAgICAgIGZvciAoJGogPSAwOyAkaiAtbHQgODsgJGorKykgewogICAgICAgICAgICBpZiAoJGMgLWJhbmQgMSkgeyAkYyA9IFt1aW50MzJdKFt1aW50MzJdMHhFREI4ODMyMCAtYnhvciAoJGMgLXNociAxKSkgfQogICAgICAgICAgICBlbHNlIHsgJGMgPSBbdWludDMyXSgkYyAtc2hyIDEpIH0KICAgICAgICB9CiAgICAgICAgJHRhYmxlWyRpXSA9ICRjCiAgICB9CiAgICByZXR1cm4gJHRhYmxlCn0KJHNjcmlwdDpDcmNUYWJsZSA9IE5ldy1DcmMzMlRhYmxlClRyYWNlICJ0YWJsZVsxXT0kKCRzY3JpcHQ6Q3JjVGFibGVbMV0pICjmnJ/mnJsgMTk5NTk1ODkzNCkgdGFibGVbMjU1XT0kKCRzY3JpcHQ6Q3JjVGFibGVbMjU1XSkgKOacn+acmyA3NTcxNjc3NTgpIgoKZnVuY3Rpb24gR2V0LUNyYzMyKFtieXRlW11dJGJ5dGVzKSB7CiAgICAkY3JjID0gW3VpbnQzMl0weEZGRkZGRkZGCiAgICBmb3JlYWNoICgkYiBpbiAkYnl0ZXMpIHsKICAgICAgICAkY3JjID0gW3VpbnQzMl0oJHNjcmlwdDpDcmNUYWJsZVsoJGNyYyAtYnhvciAkYikgLWJhbmQgMHhGRl0gLWJ4b3IgKCRjcmMgLXNociA4KSkKICAgIH0KICAgIHJldHVybiBbdWludDMyXSgkY3JjIC1ieG9yIFt1aW50MzJdMHhGRkZGRkZGRikKfQoKIyDmoIflh4bmtYvor5XlkJHph486IENSQzMyKCIxMjM0NTY3ODkiKSDlv4XpobvnrYnkuo4gY2JmNDM5MjYKJHZlYyA9IFtTeXN0ZW0uVGV4dC5FbmNvZGluZ106OkFTQ0lJLkdldEJ5dGVzKCcxMjM0NTY3ODknKQokdmVjQ3JjID0gJ3swOng4fScgLWYgKEdldC1DcmMzMiAkdmVjKQpUcmFjZSAiQ1JDMzIoMTIzNDU2Nzg5KT0kdmVjQ3JjICjmnJ/mnJsgY2JmNDM5MjYpIgoKdHJ5IHsKICAgIFRyYWNlICJzdGFnZTEgVGVzdC1QYXRoLi4uIgogICAgaWYgKC1ub3QgKFRlc3QtUGF0aCAtTGl0ZXJhbFBhdGggJEV4ZVBhdGgpKSB7IFRyYWNlICJGQUlMOiBFeGVQYXRoIOS4jeWtmOWcqCI7IGV4aXQgMSB9CiAgICBUcmFjZSAic3RhZ2UxIE9LIgoKICAgIFRyYWNlICJzdGFnZTIg6K+75bC+6YOoIDJNQi4uLiIKICAgICRmcyA9IFtTeXN0ZW0uSU8uRmlsZV06Ok9wZW5SZWFkKCRFeGVQYXRoKQogICAgdHJ5IHsKICAgICAgICAkdGFpbE1heCA9IDJNQgogICAgICAgICRsZW4gPSAkZnMuTGVuZ3RoCiAgICAgICAgJHJlYWQgPSBbaW50XVtNYXRoXTo6TWluKCR0YWlsTWF4LCAkbGVuKQogICAgICAgIFRyYWNlICJzdGFnZTIgbGVuPSRsZW4gcmVhZD0kcmVhZCB0YWlsTWF4VHlwZT0kKCR0YWlsTWF4LkdldFR5cGUoKS5OYW1lKSIKICAgICAgICAkZnMuU2VlaygkbGVuIC0gJHJlYWQsICdCZWdpbicpIHwgT3V0LU51bGwKICAgICAgICAkdGFpbCA9IE5ldy1PYmplY3QgYnl0ZVtdICRyZWFkCiAgICAgICAgJG4gPSAkZnMuUmVhZCgkdGFpbCwgMCwgJHJlYWQpCiAgICAgICAgVHJhY2UgInN0YWdlMiBSZWFk6L+U5ZueIG49JG4gKOacn+acmyAkcmVhZCkiCiAgICB9IGZpbmFsbHkgeyAkZnMuQ2xvc2UoKSB9CiAgICBUcmFjZSAic3RhZ2UyIE9LIGJ5dGVzPSQoJHRhaWwuTGVuZ3RoKSIKCiAgICBUcmFjZSAic3RhZ2UzIElTTy04ODU5LTEg6Kej56CBLi4uIgogICAgJGVuY0J5dGUgPSBbU3lzdGVtLlRleHQuRW5jb2RpbmddOjpHZXRFbmNvZGluZygyODU5MSkKICAgICR0YWlsU3RyID0gJGVuY0J5dGUuR2V0U3RyaW5nKCR0YWlsKQogICAgVHJhY2UgInN0YWdlMyB0YWlsU3RyLkxlbmd0aD0kKCR0YWlsU3RyLkxlbmd0aCkgKOacn+acmyAkKCR0YWlsLkxlbmd0aCkpIgogICAgVHJhY2UgInN0YWdlMyBPSyIKCiAgICBUcmFjZSAic3RhZ2U0IOaJviBWMSDmoIforrAuLi4iCiAgICAkcG9zID0gJHRhaWxTdHIuTGFzdEluZGV4T2YoJE1hcmtWMSwgW1N5c3RlbS5TdHJpbmdDb21wYXJpc29uXTo6T3JkaW5hbCkKICAgIFRyYWNlICJzdGFnZTQgcG9zPSRwb3MgKFBIUOWfuuWHhiAxOTM0MTg5KSIKICAgIGlmICgkcG9zIC1sdCAwKSB7IFRyYWNlICJGQUlMOiDml6AgVjEg5qCH6K6wIjsgZXhpdCAxIH0KCiAgICAkZW5kID0gJHRhaWxTdHIuSW5kZXhPZigkTWFya0VuZCwgJHBvcywgW1N5c3RlbS5TdHJpbmdDb21wYXJpc29uXTo6T3JkaW5hbCkKICAgIFRyYWNlICJzdGFnZTQgZW5kPSRlbmQgKFBIUOWfuuWHhiAyMDk3MTI1KSIKICAgIGlmICgkZW5kIC1sdCAwKSB7IFRyYWNlICJGQUlMOiDml6AgRU5EIOagh+iusCI7IGV4aXQgMSB9CgogICAgJGpzb25TdGFydCA9ICRwb3MgKyAkTWFya1YxLkxlbmd0aAogICAgJGpzb24gPSAkdGFpbFN0ci5TdWJzdHJpbmcoJGpzb25TdGFydCwgJGVuZCAtICRqc29uU3RhcnQpCiAgICAkY3JjSGV4ID0gJHRhaWxTdHIuU3Vic3RyaW5nKCRlbmQgKyAkTWFya0VuZC5MZW5ndGgsIDgpCiAgICBUcmFjZSAic3RhZ2U0IGpzb24uTGVuZ3RoPSQoJGpzb24uTGVuZ3RoKSAoUEhQ5Z+65YeGIDE2MjkxOSkgY3JjSGV4PSRjcmNIZXgiCgogICAgVHJhY2UgInN0YWdlNSBDUkMg5qCh6aqMLi4uIgogICAgJGpzb25CeXRlcyA9ICRlbmNCeXRlLkdldEJ5dGVzKCRqc29uKQogICAgVHJhY2UgInN0YWdlNSBqc29uQnl0ZXMuTGVuZ3RoPSQoJGpzb25CeXRlcy5MZW5ndGgpIgogICAgJGNhbGMgPSAoJ3swOng4fScgLWYgKEdldC1DcmMzMiAkanNvbkJ5dGVzKSkKICAgIFRyYWNlICJzdGFnZTUgY2FsYz0kY2FsYyBmaWxlPSQoJGNyY0hleC5Ub0xvd2VySW52YXJpYW50KCkpIOebuOetiT0kKCRjYWxjIC1lcSAkY3JjSGV4LlRvTG93ZXJJbnZhcmlhbnQoKSkiCiAgICBpZiAoJGNhbGMgLW5lICRjcmNIZXguVG9Mb3dlckludmFyaWFudCgpKSB7IFRyYWNlICJGQUlMOiBDUkMg5LiN5Yy56YWNIjsgZXhpdCAxIH0KCiAgICBUcmFjZSAic3RhZ2U2IFVURjgg6Kej56CBICsgQ29udmVydEZyb20tSnNvbi4uLiIKICAgICRqc29uVGV4dCA9IFtTeXN0ZW0uVGV4dC5FbmNvZGluZ106OlVURjguR2V0U3RyaW5nKCRqc29uQnl0ZXMpCiAgICAkYnJhbmQgPSAkanNvblRleHQgfCBDb252ZXJ0RnJvbS1Kc29uCiAgICBpZiAoLW5vdCAkYnJhbmQpIHsgVHJhY2UgIkZBSUw6IENvbnZlcnRGcm9tLUpzb24g6L+U5Zue56m6IjsgZXhpdCAxIH0KICAgIFRyYWNlICJzdGFnZTYgT0sgYXBwX25hbWU9JCgkYnJhbmQuYXBwX25hbWUpIGFnZW50X2NvZGU9JCgkYnJhbmQuYWdlbnRfY29kZSkgdmVyc2lvbj0kKCRicmFuZC52ZXJzaW9uKSBpY29uTGVuPSQoW3N0cmluZ10kYnJhbmQuaWNvbl9pY29fYjY0KS5MZW5ndGgiCgogICAgVHJhY2UgInN0YWdlNyDlhpkgYnJhbmQuanNvbi4uLiIKICAgIFtTeXN0ZW0uSU8uRmlsZV06OldyaXRlQWxsQnl0ZXMoKEpvaW4tUGF0aCAkT3V0RGlyICdicmFuZC5qc29uJyksICRqc29uQnl0ZXMpCiAgICBUcmFjZSAic3RhZ2U3IE9LIgoKICAgIFRyYWNlICJzdGFnZTgg5YaZIGJyYW5kLmluaS4uLiIKICAgICRpbmkgPSAiW2JyYW5kXWByYG4iICsKICAgICAgICAoJ2FwcF9uYW1lPXswfScgLWYgJGJyYW5kLmFwcF9uYW1lKSArICJgcmBuIiArCiAgICAgICAgKCdhZ2VudF9jb2RlPXswfScgLWYgJGJyYW5kLmFnZW50X2NvZGUpICsgImByYG4iICsKICAgICAgICAoJ3ZlcnNpb249ezB9JyAtZiAkYnJhbmQudmVyc2lvbikgKyAiYHJgbiIgKwogICAgICAgICgnaGFzX2xvZ289ezB9JyAtZiBbYm9vbF0oJGJyYW5kLmljb25faWNvX2I2NCkpICsgImByYG4iCiAgICAkaW5pIHwgT3V0LUZpbGUgLUZpbGVQYXRoIChKb2luLVBhdGggJE91dERpciAnYnJhbmQuaW5pJykgLUVuY29kaW5nIFVuaWNvZGUKICAgIFRyYWNlICJzdGFnZTggT0siCgogICAgVHJhY2UgInN0YWdlOSDlhpkgYnJhbmQuaWNvLi4uIgogICAgaWYgKCRicmFuZC5pY29uX2ljb19iNjQpIHsKICAgICAgICBbU3lzdGVtLklPLkZpbGVdOjpXcml0ZUFsbEJ5dGVzKChKb2luLVBhdGggJE91dERpciAnYnJhbmQuaWNvJyksCiAgICAgICAgICAgIFtDb252ZXJ0XTo6RnJvbUJhc2U2NFN0cmluZyhbc3RyaW5nXSRicmFuZC5pY29uX2ljb19iNjQpKQogICAgfQogICAgVHJhY2UgInN0YWdlOSBPSyIKCiAgICBUcmFjZSAiQUxMIFNUQUdFUyBQQVNTIgogICAgZXhpdCAwCn0gY2F0Y2ggewogICAgVHJhY2UgKCJFWENFUFRJT046ICIgKyAkXy5FeGNlcHRpb24uR2V0VHlwZSgpLkZ1bGxOYW1lICsgIiA6OiAiICsgJF8uRXhjZXB0aW9uLk1lc3NhZ2UpCiAgICBUcmFjZSAoIkFUOiAiICsgJF8uSW52b2NhdGlvbkluZm8uUG9zaXRpb25NZXNzYWdlKQogICAgZXhpdCAxCn0K"))
-          New-Item -ItemType Directory -Force -Path "diagout" | Out-Null
-          $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",(Resolve-Path "diag.ps1").Path,"-ExePath",(Resolve-Path "installer.exe").Path,"-OutDir",(Resolve-Path "diagout").Path -Wait -PassThru -NoNewWindow
-          Write-Host "diag exit code = $($p.ExitCode)"
-          Write-Host "========== brand_trace.log =========="
-          Get-Content "diagout/brand_trace.log" -ErrorAction SilentlyContinue | Write-Host
-          Write-Host "========== diagout 目录 =========="
-          Get-ChildItem "diagout" | Select-Object Name, Length | Format-Table | Out-String | Write-Host
-          if (Test-Path "diagout/brand.ini") {
-            Write-Host "--- brand.ini 内容 ---"
-            Get-Content "diagout/brand.ini" | Write-Host
+          $log = Join-Path $env:RUNNER_TEMP 't15_install.log'
+          $p = Start-Process -FilePath (Resolve-Path 'installer.exe') `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" `
+            -Wait -PassThru
+          Write-Host "installer exit code = $($p.ExitCode)"
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          Write-Host '========== install-time brand_reader trace (from installer run) =========='
+          if (Test-Path $trace) { Get-Content -LiteralPath $trace | Write-Host } else { Write-Host '!! trace log NOT created (script died before Init-BrandLog write or log write failed)' }
+
+      - name: Run shipped brand_reader.ps1 directly under PS5.1 and PS7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $shipped = Join-Path $env:ProgramFiles 'doubaoClient\brand_reader.ps1'
+          if (-not (Test-Path -LiteralPath $shipped)) { throw "shipped script not found: $shipped" }
+
+          Write-Host '========== shipped script head bytes (hex) =========='
+          $bytes = [System.IO.File]::ReadAllBytes($shipped)
+          $head = ($bytes | Select-Object -First 96 | ForEach-Object { $_.ToString('x2') }) -join ' '
+          Write-Host $head
+          Write-Host ("total_bytes={0} has_bom={1} crlf_count={2}" -f $bytes.Length, `
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF), `
+            ([regex]::Matches([System.Text.Encoding]::ASCII.GetString($bytes), "`r`n")).Count)
+
+          New-Item -ItemType Directory -Force -Path 'diagout' | Out-Null
+          $installer = (Resolve-Path 'installer.exe').Path
+          foreach ($ps in @('powershell.exe','pwsh.exe')) {
+            $tag = $ps -replace '\.exe$',''
+            $out = Join-Path $env:RUNNER_TEMP ("run_{0}_out.txt" -f $tag)
+            $err = Join-Path $env:RUNNER_TEMP ("run_{0}_err.txt" -f $tag)
+            Remove-Item $out,$err -Force -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $ps `
+              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Resolve-Path $shipped).Path, `
+                '-ExePath',$installer,'-OutDir',(Resolve-Path 'diagout').Path `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            Write-Host ("========== {0} exit={1} ==========" -f $ps, $p.ExitCode)
+            Write-Host "--- stdout ---"
+            if (Test-Path $out) { Get-Content $out | Write-Host }
+            Write-Host "--- stderr ---"
+            if (Test-Path $err) { Get-Content $err | Write-Host }
           }
+
+          Write-Host '========== direct-run trace (appended) =========='
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path $trace) { Get-Content -LiteralPath $trace | Write-Host }
+
+          Write-Host '========== diagout dir =========='
+          Get-ChildItem 'diagout' | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+          if (Test-Path 'diagout\brand.ini') {
+            Write-Host '--- brand.ini content ---'
+            Get-Content 'diagout\brand.ini' | Write-Host
+          }
+          Copy-Item $shipped -Destination 'shipped_brand_reader.ps1' -Force
+          Copy-Item $trace -Destination 'shipped_run_trace.log' -Force -ErrorAction SilentlyContinue
 
       - name: Upload diag evidence
         if: always()
@@ -61,9 +110,13 @@ jobs:
         with:
           name: brand-diag-evidence
           path: |
-            diagout/brand_trace.log
-            diagout/brand.json
-            diagout/brand.ini
-            diagout/brand.ico
+            shipped_brand_reader.ps1
+            shipped_run_trace.log
+            diagout/
+            ${{ runner.temp }}/t15_install.log
+            ${{ runner.temp }}/run_powershell_out.txt
+            ${{ runner.temp }}/run_powershell_err.txt
+            ${{ runner.temp }}/run_pwsh_out.txt
+            ${{ runner.temp }}/run_pwsh_err.txt
           retention-days: 7
           if-no-files-found: ignore
