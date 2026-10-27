@@ -198,6 +198,9 @@ jobs:
           # 脚本自身的写后回读会在真实安装时给出准确结果并写入安装日志。
           if ($scRc -ne 0) { Write-Host "!! shortcut_fix exit $scRc (runner COM 已知不可靠, 仅警告)" }
           else { Write-Host 'PS5.1 shortcut_fix self-test PASS' }
+          # GH Actions 的 pwsh 包装器会把最后一条原生命令的 LASTEXITCODE 作为步骤
+          # 退出码 —— 上面 shortcut_fix 故意失败(warn-only), 必须清零, 否则步骤假失败
+          $global:LASTEXITCODE = 0
           Write-Host 'PS5.1 brand_reader self-test PASS'
 
       - name: Install dependencies
