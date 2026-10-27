@@ -88,7 +88,7 @@ jobs:
 
           # 合成安装包: PE 头似的垃圾 + 品牌 trailer; CRC 用 python zlib(权威实现)生成
           $py = @'
-          import zlib, json, base64
+          import zlib, json, base64, struct
           brand = {
               "app_name": "\u8c46\u5305\u6d4b\u8bd5\u54c1\u724c",
               "agent_code": "AGTEST",
@@ -100,9 +100,18 @@ jobs:
           crc = "%08x" % (zlib.crc32(jb) & 0xFFFFFFFF)
           head = b"MZ" + b"\x00" * 2048
           open("test_brand.exe", "wb").write(head + b"\n<<<T15BRAND_V1>>>" + jb + b"<<<T15BRAND_END>>>" + crc.encode() + b"\n")
-          open("test_client.exe", "wb").write(head)
+          # 2026-10-27: 客户端靶子带真实 PyInstaller 尾部结构([假归档][88B cookie]),
+          # 用于验证 brand_reader -AppendToExe 的 cookie 感知回写(1.0.14..1.0.20
+          # 把 trailer 盲追加到 cookie 之后, 客户端启动即挂 "Could not load
+          # PyInstaller's embedded PKG archive from the executable")
+          arch = b"FAKEPYIARCHIVE" * 16
+          body_len = 17 + len(jb) + 18 + 8          # V1 mark + json + END mark + crc8
+          pkglen1 = len(arch) + 88 + body_len + 2 + 88   # 追加后应有的 pkglen
+          cookie = b"MEI\x0c\x0b\x0a\x0b\x0e" + struct.pack(">IIIi", len(arch) + 88, 0, len(arch), 311) + b"python313.dll".ljust(64, b"\x00")
+          open("test_client.exe", "wb").write(head + arch + cookie)
+          open("expected_pkglen.txt", "wb").write(str(pkglen1).encode())
           open("test_expect.json", "wb").write(jb)
-          print("crc", crc, "json_len", len(jb))
+          print("crc", crc, "json_len", len(jb), "pkglen1", pkglen1)
           '@
           Set-Content -LiteralPath 'make_test.py' -Value $py -Encoding ASCII
           python make_test.py
@@ -136,6 +145,27 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'ps51out2' | Out-Null
           & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
           if ($LASTEXITCODE -ne 0) { throw "append channel failed (exit $LASTEXITCODE)" }
+
+          # 2026-10-27: cookie 感知回写验证 —— 追加后 PyInstaller cookie 必须仍在
+          # EOF 且 pkglen 已按 [trailer]+[cookie] 调整, 否则客户端引导器启动即挂
+          $py2 = @'
+          import struct, sys
+          expect = int(open("expected_pkglen.txt").read().strip())
+          data = open("test_client.exe", "rb").read()
+          ck = data[-88:]
+          if ck[:8] != b"MEI\x0c\x0b\x0a\x0b\x0e":
+              sys.exit("cookie magic not at EOF: %r" % ck[:8])
+          pkglen, toc, toclen = struct.unpack_from(">III", ck, 8)
+          if pkglen != expect:
+              sys.exit("cookie pkglen %d != expected %d" % (pkglen, expect))
+          if toc + toclen > pkglen:
+              sys.exit("cookie toc/toclen invalid: %d+%d > %d" % (toc, toclen, pkglen))
+          print("pyinstaller cookie verified at EOF, pkglen=%d (expect %d)" % (pkglen, expect))
+          '@
+          Set-Content -LiteralPath 'verify_cookie.py' -Value $py2 -Encoding ASCII
+          python verify_cookie.py
+          if ($LASTEXITCODE -ne 0) { throw 'PyInstaller cookie-aware append failed (client would not boot)' }
+
           $before = (Get-Item 'test_client.exe').Length
           & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
           if ($LASTEXITCODE -ne 0) { throw "append idempotent run failed (exit $LASTEXITCODE)" }
