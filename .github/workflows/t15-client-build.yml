@@ -179,15 +179,17 @@ jobs:
           $tailStr = [System.Text.Encoding]::GetEncoding(28591).GetString($tailBuf)
           if (-not $tailStr.Contains('<<<T15BRAND_V1>>>')) { throw 'appended trailer missing on client exe' }
 
-          # 2026-10-27: shortcut_fix.ps1 PS5.1 门禁(写后回读, 失败即中止构建)
+          # 2026-10-27: shortcut_fix.ps1 PS5.1 门禁(写后回读, 失败即中止构建)。
+          # 与真实安装器一致: 全部传绝对路径(相对路径下 WScript Save() 不可靠)
           New-Item -ItemType Directory -Force -Path 'ps51sc' | Out-Null
-          $dummy = Join-Path 'ps51sc' 'brandtest.exe'
+          $scRoot = (Get-Location).Path
+          $dummy = Join-Path $scRoot 'ps51sc\brandtest.exe'
           $dummyBytes = New-Object byte[] 128
           $dummyBytes[0] = 0x4D; $dummyBytes[1] = 0x5A
           [System.IO.File]::WriteAllBytes($dummy, $dummyBytes)
-          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/shortcut_fix.ps1' `
-            -LnkPath 'ps51sc/test.lnk' -Target $dummy -WorkDir 'ps51sc' `
-            -IconPath 'client-src/installer/default.ico' -Description '品牌测试'
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scRoot 'client-src\installer\shortcut_fix.ps1') `
+            -LnkPath (Join-Path $scRoot 'ps51sc\test.lnk') -Target $dummy -WorkDir (Join-Path $scRoot 'ps51sc') `
+            -IconPath (Join-Path $scRoot 'client-src\installer\default.ico') -Description '品牌测试'
           $scRc = $LASTEXITCODE
           Get-ChildItem 'ps51sc' | ForEach-Object { Write-Host ("  {0} {1}" -f $_.Name, $_.Length) }
           if ($scRc -ne 0) { throw "shortcut_fix failed under PS5.1 (exit $scRc)" }
