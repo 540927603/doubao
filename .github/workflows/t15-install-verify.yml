@@ -236,6 +236,58 @@ jobs:
             Add-Check '客户端 exe 图标=品牌 logo(字节级)' $false "missing client exe or brand.ico"
           }
 
+          # 4.7) 桌面快捷方式: 目标=品牌 exe 且 IconLocation 钉到 brand.ico
+          #      (2026-10-27 修复: [Icons] 建快捷方式早于图标替换, shell 图标缓存
+          #       让桌面一直显示默认图标 → ssPostInstall 里重写 .lnk 并钉图标)
+          $desk = [Environment]::GetFolderPath('CommonDesktopDirectory')
+          $lnkPath = Join-Path $desk ($env:EXPECT_APP_NAME + '.lnk')
+          if (Test-Path -LiteralPath $lnkPath) {
+            $ws = New-Object -ComObject WScript.Shell
+            $lnk = $ws.CreateShortcut($lnkPath)
+            $okT = ($lnk.TargetPath -ieq (Join-Path $app ($env:EXPECT_APP_NAME + '.exe')))
+            Add-Check '桌面快捷方式目标=品牌 exe' $okT ("TargetPath={0}" -f $lnk.TargetPath)
+            if (Test-Path -LiteralPath $icoPath) {
+              $okI = ($lnk.IconLocation -match 'brand\.ico')
+              Add-Check '桌面快捷方式图标=brand.ico' $okI ("IconLocation={0}" -f $lnk.IconLocation)
+            } else {
+              Write-Host "无 brand.ico, 跳过快捷方式图标钉定检查"
+            }
+          } else {
+            Add-Check '桌面快捷方式存在' $false $lnkPath
+          }
+
+          # 4.8) PyInstaller PKG 完整性(2026-10-27 新增, 1.0.20 用户实测启动即挂
+          #      "Could not load PyInstaller's embedded PKG archive": UpdateResource
+          #      丢了 overlay + trailer 又盲追加在 cookie 之后)。客户端引导器从
+          #      【最后 88 字节】读 cookie 并按 archive_start = filesize - pkglen
+          #      定位归档; 这里逐字段验证安装后的品牌 exe 引导器数学成立。
+          if (Test-Path -LiteralPath $brandExe) {
+            $pkgPy = @'
+          import struct, sys
+          data = open(sys.argv[1], 'rb').read()
+          if len(data) < 88:
+              sys.exit('file too small')
+          ck = data[-88:]
+          if ck[:8] != b'MEI\x0c\x0b\x0a\x0b\x0e':
+              sys.exit('PyInstaller cookie magic NOT at EOF (bootloader would fail): %r' % ck[:8])
+          pkglen, toc, toclen = struct.unpack_from('>III', ck, 8)
+          pylib = ck[24:88].rstrip(b'\x00')
+          if not (88 <= pkglen <= len(data)):
+              sys.exit('cookie pkglen %d invalid for filesize %d' % (pkglen, len(data)))
+          if toc + toclen > pkglen:
+              sys.exit('cookie toc %d+%d exceeds pkglen %d' % (toc, toclen, pkglen))
+          arch_start = len(data) - pkglen
+          print('cookie OK: pkglen=%d toc=%d toclen=%d pylib=%r archive_start=%d filesize=%d'
+                % (pkglen, toc, toclen, pylib, arch_start, len(data)))
+          '@
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'check_pkg.py') -Value $pkgPy -Encoding ASCII
+            $outPkg = python (Join-Path $env:RUNNER_TEMP 'check_pkg.py') $brandExe 2>&1
+            $pkgRc = $LASTEXITCODE
+            Add-Check '客户端 exe PyInstaller PKG 完整性(可启动)' ($pkgRc -eq 0) (($outPkg | Out-String).Trim())
+          } else {
+            Add-Check '客户端 exe PyInstaller PKG 完整性(可启动)' $false 'missing client exe'
+          }
+
           # 5) Chromium 落地约定路径
           $chrome1 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win\chrome.exe'
           $chrome2 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win64\chrome.exe'
