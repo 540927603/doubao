@@ -238,19 +238,51 @@ jobs:
 
           # 4.7) 桌面快捷方式: 目标=品牌 exe 且 IconLocation 钉到 brand.ico
           #      (2026-10-27 修复: [Icons] 建快捷方式早于图标替换, shell 图标缓存
-          #       让桌面一直显示默认图标 → ssPostInstall 里重写 .lnk 并钉图标)
+          #       让桌面一直显示默认图标 → ssPostInstall 里 shortcut_fix.ps1 重写
+          #       .lnk 并钉图标)。WScript COM 读不出时回退 .lnk 字节级扫描。
           $desk = [Environment]::GetFolderPath('CommonDesktopDirectory')
           $lnkPath = Join-Path $desk ($env:EXPECT_APP_NAME + '.lnk')
+          function Find-Bytes([byte[]]$hay, [byte[]]$needle) {
+            for ($i = 0; $i -le $hay.Length - $needle.Length; $i++) {
+              $m = $true
+              for ($j = 0; $j -lt $needle.Length; $j++) {
+                if ($hay[$i + $j] -ne $needle[$j]) { $m = $false; break }
+              }
+              if ($m) { return $true }
+            }
+            return $false
+          }
           if (Test-Path -LiteralPath $lnkPath) {
-            $ws = New-Object -ComObject WScript.Shell
-            $lnk = $ws.CreateShortcut($lnkPath)
-            $okT = ($lnk.TargetPath -ieq (Join-Path $app ($env:EXPECT_APP_NAME + '.exe')))
-            Add-Check '桌面快捷方式目标=品牌 exe' $okT ("TargetPath={0}" -f $lnk.TargetPath)
-            if (Test-Path -LiteralPath $icoPath) {
-              $okI = ($lnk.IconLocation -match 'brand\.ico')
-              Add-Check '桌面快捷方式图标=brand.ico' $okI ("IconLocation={0}" -f $lnk.IconLocation)
+            $exeName = $env:EXPECT_APP_NAME + '.exe'
+            $tp = ''
+            $il = ''
+            try {
+              $ws = New-Object -ComObject WScript.Shell
+              $lnk = $ws.CreateShortcut($lnkPath)
+              $tp = [string]$lnk.TargetPath
+              $il = [string]$lnk.IconLocation
+            } catch { Write-Host ("WScript COM read failed: {0}" -f $_.Exception.Message) }
+            if ($tp -ne '') {
+              $okT = ($tp -ieq (Join-Path $app $exeName))
+              Add-Check '桌面快捷方式目标=品牌 exe' $okT ("TargetPath={0}" -f $tp)
+              if (Test-Path -LiteralPath $icoPath) {
+                $okI = ($il -match 'brand\.ico')
+                Add-Check '桌面快捷方式图标=brand.ico' $okI ("IconLocation={0}" -f $il)
+              } else {
+                Write-Host "无 brand.ico, 跳过快捷方式图标钉定检查"
+              }
             } else {
-              Write-Host "无 brand.ico, 跳过快捷方式图标钉定检查"
+              # COM 读取为空(偶发) → .lnk 字节级兜底: 目标 exe 名与 brand.ico 必须
+              # 以 ANSI 或 UTF-16LE 形式存在于 .lnk 文件(Inno/PS 写 lnk 的两种编码)
+              $raw = [System.IO.File]::ReadAllBytes($lnkPath)
+              $exeU = [System.Text.Encoding]::Unicode.GetBytes($exeName)
+              $okT = (Find-Bytes $raw $exeU) -or (Find-Bytes $raw ([System.Text.Encoding]::ASCII.GetBytes($exeName)))
+              Add-Check '桌面快捷方式目标=品牌 exe' $okT ("COM 读取为空, 字节级扫描 exeName={0} lnk_size={1}" -f $exeName, $raw.Length)
+              if (Test-Path -LiteralPath $icoPath) {
+                $okI = (Find-Bytes $raw ([System.Text.Encoding]::Unicode.GetBytes('brand.ico'))) -or
+                       (Find-Bytes $raw ([System.Text.Encoding]::ASCII.GetBytes('brand.ico')))
+                Add-Check '桌面快捷方式图标=brand.ico' $okI 'COM 读取为空, 字节级扫描 brand.ico'
+              }
             }
           } else {
             Add-Check '桌面快捷方式存在' $false $lnkPath
