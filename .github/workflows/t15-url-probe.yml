@@ -1,0 +1,44 @@
+name: t15-url-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'base url, e.g. https://example.com'
+        required: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe target from runner network
+        shell: pwsh
+        env:
+          T: ${{ inputs.target }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $urls = @(
+            "$env:T/",
+            "$env:T/api/gh_build/ping",
+            "$env:T/api/gh_build/source?token=probe-invalid",
+            "$env:T/admin"
+          )
+          foreach ($u in $urls) {
+            Write-Host "===== GET $u"
+            curl.exe -sS -v --max-time 60 -o probe.bin $u 2>&1 | ForEach-Object { Write-Host $_ }
+            $sz = (Test-Path probe.bin) ? (Get-Item probe.bin).Length : 0
+            Write-Host "RESULT url=$u exit=$LASTEXITCODE size=$sz"
+            if ($sz -gt 0 -and $sz -le 4096) {
+              $bytes = [System.IO.File]::ReadAllBytes('probe.bin')
+              $hex = ($bytes | Select-Object -First 256 | ForEach-Object { $_.ToString('x2') }) -join ''
+              Write-Host "hex256=$hex"
+              Write-Host ("text=" + [System.Text.Encoding]::UTF8.GetString($bytes))
+            } elseif ($sz -gt 4096) {
+              Write-Host "big response, first 64 bytes hex:"
+              $bytes = [System.IO.File]::ReadAllBytes('probe.bin')
+              $hex = ($bytes | Select-Object -First 64 | ForEach-Object { $_.ToString('x2') }) -join ''
+              Write-Host "hex64=$hex"
+            }
+            Remove-Item probe.bin -Force -ErrorAction SilentlyContinue
+          }
