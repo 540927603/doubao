@@ -216,9 +216,10 @@ jobs:
         shell: pwsh
         env:
           PYTHONIOENCODING: 'utf-8'
+          SITE_URL: ${{ inputs.site_url }}
         run: |
           Set-Location client-src
-          python build_exe.py --installer --version "${{ inputs.version }}"
+          python build_exe.py --installer --version "${{ inputs.version }}" --site-url "$env:SITE_URL"
 
       - name: Upload installer to server (chunked, resumable)
         shell: pwsh
