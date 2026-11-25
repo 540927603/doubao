@@ -112,13 +112,25 @@ jobs:
           if ($sha -ne "$($b.sha256)".ToLower()) { throw "新安装包 sha256 不符: $sha != $($b.sha256)" }
           Write-Host "新安装包下载 + sha256 校验通过(与客户端下载校验同口径)"
 
-          # c) 下载升级前要装的旧版安装包(客户端老下载地址, 令牌校验同一条)
-          $prevUrl = "$env:SITE_URL/api/app/download?id=$env:PREV_BUILD_ID&token=$env:PREV_DL_TOKEN"
-          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o prev_installer.exe $prevUrl
-          $psz = (Test-Path prev_installer.exe) ? (Get-Item prev_installer.exe).Length : 0
-          Write-Host "prev installer: curl exit=$LASTEXITCODE size=$psz"
-          if ($psz -le 4096 -and $psz -gt 0) { Write-Host ('prev download resp=' + (Get-Content prev_installer.exe -Raw)) }
-          if ($LASTEXITCODE -ne 0 -or $psz -le 100MB) { throw "旧版安装包下载失败/不完整(<100MB): $psz" }
+          # c) 下载升级前要装的旧版安装包 —— 必须走与客户端 check_update 完全同款的
+          #    /api/dl/<文件名>.exe 直链(route.php: 'api/dl/:fn')。2026-11-25 修复:
+          #    此前用的 /api/app/download?id=x 在 nginx 层 404(TP5 日志无该请求),
+          #    旧版从未装上 → 后续所有升级步骤必挂,纯属验证脚本自身 URL 错误,
+          #    真实客户端链路(/api/dl)一直正常。
+          $prevUrl = ("{0}/api/dl/doubao-{1}-{2}.exe?id={2}&token={3}" -f `
+            $env:SITE_URL, $prevVer, $env:PREV_BUILD_ID, $env:PREV_DL_TOKEN)
+          Write-Host "prev installer url: $($prevUrl -replace 'token=[^&]+', 'token=***')"
+          $psz = 0
+          $prevOk = $false
+          for ($i = 1; $i -le 5; $i++) {
+            curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o prev_installer.exe $prevUrl
+            $psz = (Test-Path prev_installer.exe) ? (Get-Item prev_installer.exe).Length : 0
+            Write-Host "prev installer download try $($i): curl exit=$LASTEXITCODE size=$psz"
+            if ($LASTEXITCODE -eq 0 -and $psz -gt 100MB) { $prevOk = $true; break }
+            if ($psz -gt 0 -and $psz -le 4096) { Write-Host ('prev download resp=' + (Get-Content prev_installer.exe -Raw)) }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $prevOk) { throw "旧版安装包下载失败/不完整(<100MB): $psz" }
 
       - name: Download installer artifact
         if: inputs.prev_build_id == ''
