@@ -338,8 +338,9 @@ jobs:
               $calc = '{0:x8}' -f [uint32]$crc
               $b2 = [System.Text.Encoding]::UTF8.GetString($jsonBytes) | ConvertFrom-Json
               $okT = ($calc -eq $crcHex.ToLowerInvariant()) -and ($b2.agent_code -eq $env:EXPECT_AGENT_CODE)
-              Add-Check '客户端 exe 尾部 trailer(CRC+agent_code)' $okT `
-                ("crc={0}/{1} agent_code={2} app_name={3}" -f $calc, $crcHex, $b2.agent_code, $b2.app_name)
+              if ($env:EXPECT_VERSION -ne '') { $okT = $okT -and ("$($b2.version)" -eq $env:EXPECT_VERSION) }
+              Add-Check '客户端 exe 尾部 trailer(CRC+agent_code+version)' $okT `
+                ("crc={0}/{1} agent_code={2} app_name={3} version={4}" -f $calc, $crcHex, $b2.agent_code, $b2.app_name, $b2.version)
             } else {
               Add-Check '客户端 exe 尾部 trailer' $false '未找到 <<<T15BRAND_V1>>> 标记'
             }
